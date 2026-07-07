@@ -1,0 +1,66 @@
+schema = "animus.plugin.v1"
+name = "animus-environment-railway"
+version = "0.1.0"
+plugin_kind = "environment"
+description = "Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image via the Railway GraphQL API, relays harness commands over an outbound WebSocket the container dials home (animus-env-transport), and deletes the service on teardown."
+
+[capabilities]
+streaming = true
+progress = false
+cancellation = false
+# The `environment` role's three-call contract plus the streaming exec variant.
+methods = [
+  "environment/prepare",
+  "environment/exec",
+  "environment/exec_stream",
+  "environment/teardown",
+  "health/check",
+]
+
+[binary]
+default = "animus-environment-railway"
+
+[[env]]
+key = "RAILWAY_TOKEN"
+description = "Railway API token used to create/delete run services (backboard GraphQL v2)."
+required = true
+
+[[env]]
+key = "RAILWAY_PROJECT_ID"
+description = "Railway project run services are created in. Overridable per-run via spec.metadata.railway_project_id."
+required = false
+
+[[env]]
+key = "RAILWAY_ENVIRONMENT_ID"
+description = "Railway environment within the project. Overridable per-run via spec.metadata.railway_environment_id."
+required = false
+
+[[env]]
+key = "ANIMUS_ENV_RELAY_PUBLIC_URL"
+description = "Public WSS URL run containers dial home to (e.g. wss://<daemon-domain>). TLS is terminated at the Railway edge; local/dev runs may omit it and dial the bound port directly."
+required = false
+
+[[env]]
+key = "ANIMUS_ENV_RELAY_PORT"
+description = "Port the in-plugin relay listener binds (default: ephemeral). Set a fixed port when the daemon's service exposes it publicly."
+required = false
+
+[[env]]
+key = "ANIMUS_ENV_RAILWAY_IMAGE"
+description = "Default base image for prepared containers when EnvironmentSpec.image is unset (default: ghcr.io/launchapp-dev/animus:v0.7.0-rc.2)."
+required = false
+
+[[env]]
+key = "ANIMUS_ENV_BRIDGE_COMMAND"
+description = "In-container start command (default: animus-env-bridge). Override while the base image does not ship the bridge entrypoint."
+required = false
+
+[[env]]
+key = "ANIMUS_ENV_DIAL_TIMEOUT_SECS"
+description = "Bound on how long prepare waits for the container to dial home (default: 300)."
+required = false
+
+[[env]]
+key = "BASE_DB_URL"
+description = "When set on the daemon host, passed through into every run container (shared cloud database endpoint)."
+required = false

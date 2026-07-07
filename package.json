@@ -1,0 +1,49 @@
+{
+  "name": "@launchapp-dev/animus-environment-railway",
+  "version": "0.1.0",
+  "description": "Railway ephemeral-container execution-environment plugin for Animus 0.7. Prepares a Railway service from the Animus base image via the Railway GraphQL API, has the container dial home over an outbound WebSocket (animus-env-transport), runs harness commands through that relay (buffered + streaming), and deletes the service on teardown. Built on animus-environment-base.",
+  "license": "Elastic-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "animus-environment-railway": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "plugin.toml",
+    "README.md",
+    "INTEGRATION.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "clean": "rm -rf dist coverage"
+  },
+  "dependencies": {
+    "@launchapp-dev/animus-env-transport": "file:../animus-env-transport",
+    "@launchapp-dev/animus-environment-base": "file:../animus-environment-base"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "typescript": "^5.5.0",
+    "vitest": "^1.6.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/launchapp-dev/animus-environment-railway"
+  },
+  "keywords": [
+    "animus",
+    "plugin",
+    "environment",
+    "railway"
+  ],
+  "author": "launchapp-dev"
+}
