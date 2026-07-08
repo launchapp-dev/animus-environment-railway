@@ -54,12 +54,41 @@ routes to this plugin's relay port). Per-run overrides:
   `animus-env-bridge` entrypoint, and the reverse MCP/subject RPC daemon
   proxy. **See [INTEGRATION.md](INTEGRATION.md) for the wiring checklist.**
 
+## Install
+
+Installable as an Animus plugin via `animus install` (git + tag):
+
+```bash
+animus plugin install launchapp-dev/animus-environment-railway
+```
+
+The install resolver downloads the GitHub Release asset for the host's target
+triple (or the `-noarch` fallback), verifies it against its `.sha256` sidecar,
+extracts, and execs the contained binary. `npm run release` builds a
+self-contained esbuild bundle (`dist/animus-environment-railway`, single JS file
+with a node shebang — it inlines `animus-env-transport`,
+`animus-environment-base`, the SDK, `ws` and `zod`, so it runs on plain node
+with no `node_modules`) and stages the correctly-named assets under
+`dist/release/`:
+
+```
+animus-environment-railway-v<version>-<target>.tar.gz          (the archive)
+animus-environment-railway-v<version>-<target>.tar.gz.sha256   (per-asset checksum)
+animus-environment-railway-v<version>-noarch.tar.gz            (universal fallback)
+animus-environment-railway-v<version>-noarch.tar.gz.sha256
+```
+
+The script prints the `gh release create` command to run by hand once the
+assets look right; it does not cut the release itself.
+
 ## Publishing note
 
 Dependencies on `animus-environment-base` / `animus-env-transport` (and,
 transitively, the SDK) are `file:../` siblings, matching the rest of the TS
-plugin family — none are on npm yet. Publish those first and switch to version
-ranges before distributing this package outside a sibling checkout.
+plugin family — none are on npm yet. That is a build-time concern only: the
+`npm run bundle` esbuild step inlines them into the single published binary, so
+the release asset carries no `file:../` references. Building from source needs
+those siblings checked out flat next to this repo.
 
 ## Develop
 
@@ -67,5 +96,7 @@ ranges before distributing this package outside a sibling checkout.
 npm install
 npm run typecheck
 npm test
-node dist/index.js --manifest   # after npm run build
+node dist/index.js --manifest   # after npm run build (tsc)
+npm run bundle                  # esbuild self-contained dist/animus-environment-railway
+npm run release                 # stage GitHub Release assets under dist/release/
 ```
