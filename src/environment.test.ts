@@ -8,7 +8,9 @@
 // integration-pending: it skips with a clear message unless RAILWAY_TOKEN +
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -20,6 +22,7 @@ import {
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
   DEFAULT_IMAGE,
+  harnessCredentialVars,
   RailwayEnvironment,
   resolveTarget,
   runVariables,
@@ -128,6 +131,29 @@ describe('pure helpers', () => {
     });
   });
 
+  it('harnessCredentialVars base64s the subscription creds + passes the github token', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'creds-'));
+    const claudeDir = join(dir, 'claude');
+    const codexDir = join(dir, 'codex');
+    mkdirSync(claudeDir);
+    mkdirSync(codexDir);
+    writeFileSync(join(claudeDir, '.credentials.json'), '{"claudeAiOauth":"c"}');
+    writeFileSync(join(codexDir, 'auth.json'), '{"tokens":"x"}');
+    const vars = harnessCredentialVars({
+      CLAUDE_CONFIG_DIR: claudeDir,
+      CODEX_OAUTH_HOME: codexDir,
+      GITHUB_TOKEN: 'ghtok',
+    } as NodeJS.ProcessEnv);
+    expect(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString()).toBe('{"claudeAiOauth":"c"}');
+    expect(Buffer.from(vars.ANIMUS_NODE_CODEX_AUTH_B64, 'base64').toString()).toBe('{"tokens":"x"}');
+    expect(vars.GITHUB_TOKEN).toBe('ghtok');
+  });
+
+  it('harnessCredentialVars skips missing creds (best-effort)', () => {
+    expect(harnessCredentialVars({ CLAUDE_CONFIG_DIR: '/nonexistent' } as NodeJS.ProcessEnv)).toEqual({});
+    expect(harnessCredentialVars({} as NodeJS.ProcessEnv)).toEqual({});
+  });
+
   it('cloneCommands builds argv-array git clones (remote urls only)', () => {
     const plan = planWorkspace(
       {
@@ -228,7 +254,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const { env, fake } = await makeEnv();
 
     const { handle } = await env.prepare({ spec: { kind: 'railway', env: { RUN_FLAG: 'yes' } } });
-    expect(handle.id).toMatch(/^railway-/);
+    expect(handle.id).toMatch(/^r[0-9a-f]{6}$/);
     expect(handle.workspace_root).toBe(WORKSPACE_ROOT);
     const meta = handle.metadata as Record<string, unknown>;
     expect(meta.service_id).toBe('svc-1');

@@ -12,6 +12,7 @@
 // (git clone / animus install) commands assembled here are argv arrays too.
 
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 import {
   planWorkspace,
@@ -152,6 +153,30 @@ export function cloneCommands(plan: WorkspacePlan): HarnessCommand[] {
   return commands;
 }
 
+/** Read the daemon-side subscription credentials + GitHub token and encode them
+ *  as per-run env vars the coder run-image's bootstrap materializes back into
+ *  files (claude `.credentials.json`, codex `auth.json`) + git/gh auth. The node
+ *  runs the SAME subscription harnesses the portal does. Best-effort: a missing
+ *  path/file/var is skipped (the node then just can't use that harness). Paths
+ *  come from CLAUDE_CONFIG_DIR / CODEX_OAUTH_HOME (declared env_required). */
+export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const vars: Record<string, string> = {};
+  const readB64 = (path: string | undefined, file: string): string | null => {
+    if (!path) return null;
+    try {
+      return readFileSync(`${path.replace(/\/$/, '')}/${file}`).toString('base64');
+    } catch {
+      return null;
+    }
+  };
+  const claude = readB64(hostEnv.CLAUDE_CONFIG_DIR, '.credentials.json');
+  if (claude) vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64 = claude;
+  const codex = readB64(hostEnv.CODEX_OAUTH_HOME, 'auth.json');
+  if (codex) vars.ANIMUS_NODE_CODEX_AUTH_B64 = codex;
+  if (hostEnv.GITHUB_TOKEN) vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
+  return vars;
+}
+
 /** The per-run variables injected into the created service's environment. */
 export function runVariables(args: {
   wssUrl: string;
@@ -165,7 +190,10 @@ export function runVariables(args: {
   // shared database endpoint the daemon itself uses.
   if (hostEnv.BASE_DB_URL) vars.BASE_DB_URL = hostEnv.BASE_DB_URL;
   Object.assign(vars, args.specEnv ?? {});
-  // Relay coordinates always win over spec env (they are the run's identity).
+  // Subscription creds + GitHub token win over spec env (they are the daemon's
+  // authoritative harness auth, base64'd for the run-image bootstrap).
+  Object.assign(vars, harnessCredentialVars(hostEnv));
+  // Relay coordinates always win (they are the run's identity).
   vars.ANIMUS_ENV_WSS_URL = args.wssUrl;
   vars.ANIMUS_ENV_RUN_TOKEN = args.token;
   vars.ANIMUS_ENV_WORKSPACE_ROOT = WORKSPACE_ROOT;

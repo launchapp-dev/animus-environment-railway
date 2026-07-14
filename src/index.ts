@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.1.2',
+  version: '0.2.0',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -64,6 +64,24 @@ const plugin = defineEnvironmentPlugin({
       name: 'ANIMUS_ENV_DIAL_TIMEOUT_SECS',
       description: 'How long prepare waits for the container to dial home (default 300).',
       required: false,
+    },
+    {
+      name: 'CLAUDE_CONFIG_DIR',
+      description:
+        'Daemon-side dir holding the Claude subscription .credentials.json; base64-injected into each node so the claude harness runs on the subscription.',
+      required: false,
+    },
+    {
+      name: 'CODEX_OAUTH_HOME',
+      description:
+        'Daemon-side dir holding the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription.',
+      required: false,
+    },
+    {
+      name: 'GITHUB_TOKEN',
+      description: 'GitHub token injected into each node for git push + PR creation from the harness.',
+      required: false,
+      sensitive: true,
     },
   ],
 

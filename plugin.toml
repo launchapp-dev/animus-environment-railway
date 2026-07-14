@@ -1,6 +1,6 @@
 schema = "animus.plugin.v1"
 name = "animus-environment-railway"
-version = "0.1.2"
+version = "0.2.0"
 plugin_kind = "environment"
 description = "Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image via the Railway GraphQL API, relays harness commands over an outbound WebSocket the container dials home (animus-env-transport), and deletes the service on teardown."
 
@@ -64,3 +64,19 @@ required = false
 key = "BASE_DB_URL"
 description = "When set on the daemon host, passed through into every run container (shared cloud database endpoint)."
 required = false
+
+[[env]]
+key = "CLAUDE_CONFIG_DIR"
+description = "Daemon-side dir with the Claude subscription .credentials.json; base64-injected into each node so the claude harness runs on the subscription."
+required = false
+
+[[env]]
+key = "CODEX_OAUTH_HOME"
+description = "Daemon-side dir with the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription."
+required = false
+
+[[env]]
+key = "GITHUB_TOKEN"
+description = "GitHub token injected into each node for git push + PR creation from the harness."
+required = false
+sensitive = true
