@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.1.0',
+  version: '0.1.1',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -41,6 +41,28 @@ const plugin = defineEnvironmentPlugin({
       name: 'ANIMUS_ENV_RELAY_PUBLIC_URL',
       description:
         'Public WSS URL run containers dial home to (e.g. wss://<daemon-domain>). TLS is terminated at the platform edge.',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_RELAY_PORT',
+      description:
+        'Fixed port the in-plugin relay binds; must equal the port the public WSS URL routes to. Required whenever ANIMUS_ENV_RELAY_PUBLIC_URL is set.',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_RAILWAY_IMAGE',
+      description:
+        'Base image for run services (overrides the built-in default). Must ship the animus-env-bridge entrypoint.',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_BRIDGE_COMMAND',
+      description: 'Start command for the run container (default: animus-env-bridge).',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_DIAL_TIMEOUT_SECS',
+      description: 'How long prepare waits for the container to dial home (default 300).',
       required: false,
     },
   ],
