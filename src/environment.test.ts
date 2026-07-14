@@ -9,7 +9,7 @@
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,7 @@ import { BridgeClient, RelayServer } from '@launchapp-dev/animus-env-transport';
 import { planWorkspace } from '@launchapp-dev/animus-environment-base';
 
 import {
+  claudeNodeCredentials,
   cloneCommands,
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
@@ -134,27 +135,62 @@ describe('pure helpers', () => {
     });
   });
 
-  it('harnessCredentialVars base64s the subscription creds + passes the github token', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'creds-'));
-    const claudeDir = join(dir, 'claude');
-    const codexDir = join(dir, 'codex');
-    mkdirSync(claudeDir);
-    mkdirSync(codexDir);
-    writeFileSync(join(claudeDir, '.credentials.json'), '{"claudeAiOauth":"c"}');
+  it('harnessCredentialVars base64s the codex auth + passes the github token', () => {
+    const codexDir = mkdtempSync(join(tmpdir(), 'codex-'));
     writeFileSync(join(codexDir, 'auth.json'), '{"tokens":"x"}');
-    const vars = harnessCredentialVars({
-      CLAUDE_CONFIG_DIR: claudeDir,
-      CODEX_OAUTH_HOME: codexDir,
-      GITHUB_TOKEN: 'ghtok',
-    } as NodeJS.ProcessEnv);
-    expect(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString()).toBe('{"claudeAiOauth":"c"}');
+    const vars = harnessCredentialVars({ CODEX_OAUTH_HOME: codexDir, GITHUB_TOKEN: 'ghtok' } as NodeJS.ProcessEnv);
     expect(Buffer.from(vars.ANIMUS_NODE_CODEX_AUTH_B64, 'base64').toString()).toBe('{"tokens":"x"}');
     expect(vars.GITHUB_TOKEN).toBe('ghtok');
   });
 
   it('harnessCredentialVars skips missing creds (best-effort)', () => {
-    expect(harnessCredentialVars({ CLAUDE_CONFIG_DIR: '/nonexistent' } as NodeJS.ProcessEnv)).toEqual({});
+    expect(harnessCredentialVars({ CODEX_OAUTH_HOME: '/nonexistent' } as NodeJS.ProcessEnv)).toEqual({});
     expect(harnessCredentialVars({} as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('claudeNodeCredentials injects a valid token as-is with the refresh token STRIPPED', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    const now = 1_000_000;
+    writeFileSync(
+      join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'A', refreshToken: 'R', expiresAt: now + 3_600_000, scopes: ['x'] } }),
+    );
+    const vars = await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now, (async () => {
+      throw new Error('must not refresh a valid token');
+    }) as unknown as typeof fetch);
+    const injected = JSON.parse(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString());
+    expect(injected.claudeAiOauth.accessToken).toBe('A');
+    expect(injected.claudeAiOauth.refreshToken).toBeUndefined();
+    expect(injected.claudeAiOauth.scopes).toEqual(['x']);
+  });
+
+  it('claudeNodeCredentials refreshes an expired token, writes it back, and strips refresh', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    const path = join(dir, '.credentials.json');
+    const now = 1_000_000;
+    writeFileSync(path, JSON.stringify({ claudeAiOauth: { accessToken: 'old', refreshToken: 'R1', expiresAt: now - 1000 } }));
+    const fetchImpl = (async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ access_token: 'A2', refresh_token: 'R2', expires_in: 3600 }),
+      text: async () => '',
+    })) as unknown as typeof fetch;
+    const vars = await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now, fetchImpl);
+    const injected = JSON.parse(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString());
+    expect(injected.claudeAiOauth.accessToken).toBe('A2');
+    expect(injected.claudeAiOauth.refreshToken).toBeUndefined();
+    // rotated token written back to /data (so the daemon stays valid)
+    const onDisk = JSON.parse(readFileSync(path, 'utf8'));
+    expect(onDisk.claudeAiOauth.refreshToken).toBe('R2');
+    expect(onDisk.claudeAiOauth.accessToken).toBe('A2');
+  });
+
+  it('claudeNodeCredentials returns {} when refresh fails or no login', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    writeFileSync(join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'x', refreshToken: 'R', expiresAt: 1 } }));
+    const failing = (async () => ({ ok: false, status: 400, json: async () => ({}), text: async () => 'invalid_grant' })) as unknown as typeof fetch;
+    expect(await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, 1_000_000, failing)).toEqual({});
+    expect(await claudeNodeCredentials({} as NodeJS.ProcessEnv, 1_000_000)).toEqual({});
   });
 
   it('parseGithubSlug extracts owner/repo from https / ssh / .git urls', () => {

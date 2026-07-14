@@ -12,7 +12,7 @@
 // (git clone / animus install) commands assembled here are argv arrays too.
 
 import { createSign, randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 
 import {
   planWorkspace,
@@ -153,28 +153,95 @@ export function cloneCommands(plan: WorkspacePlan): HarnessCommand[] {
   return commands;
 }
 
-/** Read the daemon-side subscription credentials + GitHub token and encode them
- *  as per-run env vars the coder run-image's bootstrap materializes back into
- *  files (claude `.credentials.json`, codex `auth.json`) + git/gh auth. The node
- *  runs the SAME subscription harnesses the portal does. Best-effort: a missing
- *  path/file/var is skipped (the node then just can't use that harness). Paths
- *  come from CLAUDE_CONFIG_DIR / CODEX_OAUTH_HOME (declared env_required). */
+const CLAUDE_OAUTH_TOKEN_URL =
+  process.env.CLAUDE_OAUTH_TOKEN_URL ?? 'https://console.anthropic.com/v1/oauth/token';
+const CLAUDE_OAUTH_CLIENT_ID = process.env.CLAUDE_OAUTH_CLIENT_ID ?? '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+/** Refresh the daemon `.credentials.json` this many ms before its access token
+ *  actually expires, so an in-flight node run never straddles the boundary. */
+const CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000;
+
+/** Read the daemon-side Codex auth.json + GitHub token and encode them for the
+ *  node bootstrap. Claude is handled separately (async central refresh). */
 export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
   const vars: Record<string, string> = {};
-  const readB64 = (path: string | undefined, file: string): string | null => {
-    if (!path) return null;
+  if (hostEnv.CODEX_OAUTH_HOME) {
     try {
-      return readFileSync(`${path.replace(/\/$/, '')}/${file}`).toString('base64');
+      vars.ANIMUS_NODE_CODEX_AUTH_B64 = readFileSync(
+        `${hostEnv.CODEX_OAUTH_HOME.replace(/\/$/, '')}/auth.json`,
+      ).toString('base64');
     } catch {
-      return null;
+      // no codex login on the daemon; skip
     }
-  };
-  const claude = readB64(hostEnv.CLAUDE_CONFIG_DIR, '.credentials.json');
-  if (claude) vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64 = claude;
-  const codex = readB64(hostEnv.CODEX_OAUTH_HOME, 'auth.json');
-  if (codex) vars.ANIMUS_NODE_CODEX_AUTH_B64 = codex;
+  }
   if (hostEnv.GITHUB_TOKEN) vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
   return vars;
+}
+
+/** Central Claude-subscription refresher. A node must NEVER hold the refresh
+ *  token: the claude CLI rotates it single-use, and since a node's rotation is
+ *  lost (never written back to the daemon), a refreshing node would corrupt the
+ *  shared daemon credential after one run. So the DAEMON is the sole refresher —
+ *  it refreshes `.credentials.json` in place when the access token is near expiry
+ *  (writing the rotated token back), then injects only a short-lived access token
+ *  with the refresh token STRIPPED. The node uses that access token directly and
+ *  cannot rotate anything. Best-effort: returns {} when there is no login or the
+ *  refresh fails (the node then just has no claude auth). */
+export async function claudeNodeCredentials(
+  hostEnv: NodeJS.ProcessEnv,
+  now: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Record<string, string>> {
+  const dir = hostEnv.CLAUDE_CONFIG_DIR;
+  if (!dir) return {};
+  const path = `${dir.replace(/\/$/, '')}/.credentials.json`;
+  let file: Record<string, unknown>;
+  let oauth: Record<string, unknown>;
+  try {
+    file = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    oauth = (file.claudeAiOauth as Record<string, unknown>) ?? file;
+  } catch {
+    return {};
+  }
+  const expiresAt = Number(oauth.expiresAt ?? oauth.expires_at ?? 0);
+  const refreshToken = (oauth.refreshToken ?? oauth.refresh_token) as string | undefined;
+  if (expiresAt && expiresAt - now > CLAUDE_REFRESH_SKEW_MS) {
+    // Access token still valid: inject it as-is, minus the refresh token.
+    return { ANIMUS_NODE_CLAUDE_CREDENTIALS_B64: encodeNodeClaudeCreds(file, oauth) };
+  }
+  if (!refreshToken) return {};
+  try {
+    const res = await fetchImpl(CLAUDE_OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }),
+    });
+    if (!res.ok) {
+      process.stderr.write(
+        `[animus-environment-railway] claude token refresh failed (HTTP ${res.status}); node will lack claude auth\n`,
+      );
+      return {};
+    }
+    const t = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number };
+    const newExpiry = now + Number(t.expires_in ?? 28800) * 1000;
+    const refreshed = { ...oauth, accessToken: t.access_token, refreshToken: t.refresh_token ?? refreshToken, expiresAt: newExpiry };
+    // Write the rotated token back to the daemon so it (and the next run) stay valid.
+    try {
+      writeFileSync(path, JSON.stringify({ ...file, claudeAiOauth: refreshed }));
+    } catch {
+      // /data read-only in some environments; the injected token is still fresh
+    }
+    return { ANIMUS_NODE_CLAUDE_CREDENTIALS_B64: encodeNodeClaudeCreds(file, refreshed) };
+  } catch (err) {
+    process.stderr.write(`[animus-environment-railway] claude token refresh error: ${String(err)}\n`);
+    return {};
+  }
+}
+
+/** Build the base64 `.credentials.json` injected into the node: the fresh oauth
+ *  block with the refresh token REMOVED (the node must not be able to rotate). */
+function encodeNodeClaudeCreds(file: Record<string, unknown>, oauth: Record<string, unknown>): string {
+  const { refreshToken: _r, refresh_token: _r2, ...noRefresh } = oauth;
+  return Buffer.from(JSON.stringify({ ...file, claudeAiOauth: noRefresh })).toString('base64');
 }
 
 /** The per-run variables injected into the created service's environment. */
@@ -377,13 +444,16 @@ export class RailwayEnvironment {
     // harness pushes + opens PRs AS the app. Best-effort; overrides any passthrough
     // GITHUB_TOKEN from runVariables.
     const appVars = await githubAppCredentials(spec, process.env, Math.floor(Date.now() / 1000));
+    // Central Claude refresh: inject a short-lived access token (refresh token
+    // stripped) so the node can't rotate/corrupt the shared daemon credential.
+    const claudeVars = await claudeNodeCredentials(process.env, Date.now());
     try {
       const created = await this.railway().createRunService({
         projectId,
         environmentId,
         name: serviceName,
         image,
-        variables: { ...runVariables({ wssUrl: url, token, specEnv: spec.env }), ...appVars },
+        variables: { ...runVariables({ wssUrl: url, token, specEnv: spec.env }), ...claudeVars, ...appVars },
         startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
       });
       serviceId = created.serviceId;
