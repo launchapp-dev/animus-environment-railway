@@ -11,8 +11,9 @@
 // and the in-container bridge spawns them with `shell: false`. The provision
 // (git clone / animus install) commands assembled here are argv arrays too.
 
+import { randomBytes } from 'node:crypto';
+
 import {
-  newHandleId,
   planWorkspace,
   provisionAnimus,
   type EnvironmentHandle,
@@ -25,6 +26,15 @@ import {
 import { RelayServer, type RelayServerOptions } from '@launchapp-dev/animus-env-transport';
 
 import { RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+
+// Short, Railway-valid id token: `<prefix><6 hex>`. The service name is
+// `animus-run-<instanceId>-<id>`, and Railway rejects long service names
+// (~32-char limit), so both the per-process instance id and the per-run id
+// must stay compact. 6 hex (2^24) is ample uniqueness for a project's
+// concurrent runs, and the GC sweep still matches by the shared prefix.
+function shortId(prefix: string): string {
+  return `${prefix}${randomBytes(3).toString('hex')}`;
+}
 
 /** Default base image when `EnvironmentSpec.image` is unset. */
 export const DEFAULT_IMAGE = process.env.ANIMUS_ENV_RAILWAY_IMAGE ?? 'ghcr.io/launchapp-dev/animus:v0.7.0-rc.2';
@@ -177,7 +187,7 @@ export class RailwayEnvironment {
   private relayInstance: RelayServer | null;
   /** Random per-process identity baked into service names, so a GC sweep can
    *  distinguish this instance's runs from another live plugin instance's. */
-  readonly instanceId: string = newHandleId('i');
+  readonly instanceId: string = shortId('i');
 
   constructor(deps: RailwayEnvironmentDeps = {}) {
     this.config = deps.config ?? configFromEnv();
@@ -232,7 +242,7 @@ export class RailwayEnvironment {
     const spec = req.spec;
     const { projectId, environmentId } = resolveTarget(spec, this.config);
     const image = spec.image?.trim() || DEFAULT_IMAGE;
-    const id = newHandleId('railway');
+    const id = shortId('r');
     const serviceName = `${this.instancePrefix()}${id}`;
 
     const relay = await this.relay();
