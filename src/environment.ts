@@ -11,7 +11,7 @@
 // and the in-container bridge spawns them with `shell: false`. The provision
 // (git clone / animus install) commands assembled here are argv arrays too.
 
-import { randomBytes } from 'node:crypto';
+import { createSign, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 import {
@@ -200,6 +200,81 @@ export function runVariables(args: {
   return vars;
 }
 
+/** owner/repo parsed from a github remote url (https or ssh), or null. */
+export function parseGithubSlug(url: string | undefined): { owner: string; repo: string } | null {
+  if (!url) return null;
+  const m = url.match(/github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  return m && m[1] && m[2] ? { owner: m[1], repo: m[2] } : null;
+}
+
+/** Sign a short-lived (<=10 min) GitHub App JWT (RS256) with the app private key. */
+function githubAppJwt(appId: string, privateKeyPem: string, now: number): string {
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const data = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iat: now - 60, exp: now + 540, iss: appId })}`;
+  const sig = createSign('RSA-SHA256').update(data).sign(privateKeyPem, 'base64url');
+  return `${data}.${sig}`;
+}
+
+/** Mint a repo-scoped GitHub App installation token for the run's primary repo and
+ *  return it + the app's bot commit identity (so pushes + PRs + commits are attributed
+ *  to the App, not a personal account). Best-effort: returns {} when the app is not
+ *  configured or any GitHub call fails (the node then just has no push credential). */
+export async function githubAppCredentials(
+  spec: { repos?: Array<{ url: string; primary?: boolean }> },
+  hostEnv: NodeJS.ProcessEnv,
+  now: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Record<string, string>> {
+  const appId = hostEnv.GITHUB_APP_ID;
+  const rawKey = hostEnv.GITHUB_APP_PRIVATE_KEY;
+  if (!appId || !rawKey) return {};
+  const slug = parseGithubSlug((spec.repos ?? []).find((r) => r.primary)?.url ?? spec.repos?.[0]?.url);
+  if (!slug) return {};
+  const privateKey = rawKey.includes('\\n') ? rawKey.replace(/\\n/g, '\n') : rawKey;
+  try {
+    const jwt = githubAppJwt(appId, privateKey, now);
+    const gh = async (path: string, init?: RequestInit): Promise<Record<string, unknown>> => {
+      const res = await fetchImpl(`https://api.github.com${path}`, {
+        ...init,
+        headers: {
+          authorization: `Bearer ${jwt}`,
+          accept: 'application/vnd.github+json',
+          'user-agent': 'animus-environment-railway',
+          ...init?.headers,
+        },
+      });
+      if (!res.ok) throw new Error(`GitHub ${path} -> HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      return (await res.json()) as Record<string, unknown>;
+    };
+    const install = await gh(`/repos/${slug.owner}/${slug.repo}/installation`);
+    const minted = await gh(`/app/installations/${install.id}/access_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repositories: [slug.repo] }),
+    });
+    const vars: Record<string, string> = { GITHUB_TOKEN: String(minted.token) };
+    const appSlug = hostEnv.GITHUB_APP_SLUG;
+    if (appSlug) {
+      let botId: unknown = install.app_id;
+      try {
+        botId = (await gh(`/users/${appSlug}[bot]`)).id;
+      } catch {
+        // fall back to app_id if the bot user lookup fails
+      }
+      const name = `${appSlug}[bot]`;
+      const email = `${botId}+${appSlug}[bot]@users.noreply.github.com`;
+      vars.GIT_AUTHOR_NAME = name;
+      vars.GIT_AUTHOR_EMAIL = email;
+      vars.GIT_COMMITTER_NAME = name;
+      vars.GIT_COMMITTER_EMAIL = email;
+    }
+    return vars;
+  } catch (err) {
+    process.stderr.write(`[animus-environment-railway] github app token mint failed: ${String(err)}\n`);
+    return {};
+  }
+}
+
 export interface RailwayEnvironmentDeps {
   /** Railway API (mockable). Default: a `RailwayClient` over `RAILWAY_TOKEN`. */
   railway?: RailwayApi;
@@ -298,13 +373,17 @@ export class RailwayEnvironment {
 
     let serviceId: string | null = null;
     let deploymentId: string | null | undefined;
+    // Mint a repo-scoped GitHub App token (+ bot commit identity) so the node's
+    // harness pushes + opens PRs AS the app. Best-effort; overrides any passthrough
+    // GITHUB_TOKEN from runVariables.
+    const appVars = await githubAppCredentials(spec, process.env, Math.floor(Date.now() / 1000));
     try {
       const created = await this.railway().createRunService({
         projectId,
         environmentId,
         name: serviceName,
         image,
-        variables: runVariables({ wssUrl: url, token, specEnv: spec.env }),
+        variables: { ...runVariables({ wssUrl: url, token, specEnv: spec.env }), ...appVars },
         startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
       });
       serviceId = created.serviceId;

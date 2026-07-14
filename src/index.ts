@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.2.0',
+  version: '0.3.0',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -79,9 +79,25 @@ const plugin = defineEnvironmentPlugin({
     },
     {
       name: 'GITHUB_TOKEN',
-      description: 'GitHub token injected into each node for git push + PR creation from the harness.',
+      description: 'GitHub token injected into each node for git push + PR creation from the harness (fallback when no GitHub App is configured).',
       required: false,
       sensitive: true,
+    },
+    {
+      name: 'GITHUB_APP_ID',
+      description: 'GitHub App id; when set with GITHUB_APP_PRIVATE_KEY, prepare mints a repo-scoped installation token so the node pushes + opens PRs as the app.',
+      required: false,
+    },
+    {
+      name: 'GITHUB_APP_PRIVATE_KEY',
+      description: 'GitHub App private key (PEM) used to sign the app JWT that mints the per-run installation token.',
+      required: false,
+      sensitive: true,
+    },
+    {
+      name: 'GITHUB_APP_SLUG',
+      description: 'GitHub App slug; sets the bot commit identity (<slug>[bot]) so commits are attributed to the app.',
+      required: false,
     },
   ],
 

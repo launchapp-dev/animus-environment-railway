@@ -8,6 +8,7 @@
 // integration-pending: it skips with a clear message unless RAILWAY_TOKEN +
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,7 +23,9 @@ import {
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
   DEFAULT_IMAGE,
+  githubAppCredentials,
   harnessCredentialVars,
+  parseGithubSlug,
   RailwayEnvironment,
   resolveTarget,
   runVariables,
@@ -152,6 +155,54 @@ describe('pure helpers', () => {
   it('harnessCredentialVars skips missing creds (best-effort)', () => {
     expect(harnessCredentialVars({ CLAUDE_CONFIG_DIR: '/nonexistent' } as NodeJS.ProcessEnv)).toEqual({});
     expect(harnessCredentialVars({} as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('parseGithubSlug extracts owner/repo from https / ssh / .git urls', () => {
+    expect(parseGithubSlug('https://github.com/launchapp-dev/animus-cli.git')).toEqual({
+      owner: 'launchapp-dev',
+      repo: 'animus-cli',
+    });
+    expect(parseGithubSlug('https://github.com/o/r')).toEqual({ owner: 'o', repo: 'r' });
+    expect(parseGithubSlug('git@github.com:o/r.git')).toEqual({ owner: 'o', repo: 'r' });
+    expect(parseGithubSlug('/local/path')).toBeNull();
+    expect(parseGithubSlug(undefined)).toBeNull();
+  });
+
+  it('githubAppCredentials mints a repo-scoped token + bot identity (mocked GitHub)', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const calls: Array<{ url: string; method: string }> = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      calls.push({ url: u, method: init?.method ?? 'GET' });
+      const body = u.endsWith('/installation')
+        ? { id: 42, app_id: 7 }
+        : u.endsWith('/access_tokens')
+          ? { token: 'ghs_minted' }
+          : u.includes('/users/')
+            ? { id: 999 }
+            : null;
+      return { ok: body !== null, status: body ? 200 : 404, json: async () => body, text: async () => 'x' } as Response;
+    }) as typeof fetch;
+
+    const vars = await githubAppCredentials(
+      { repos: [{ url: 'https://github.com/o/r.git', primary: true }] },
+      { GITHUB_APP_ID: '7', GITHUB_APP_PRIVATE_KEY: pem, GITHUB_APP_SLUG: 'animus' } as NodeJS.ProcessEnv,
+      1000,
+      fetchImpl,
+    );
+    expect(vars.GITHUB_TOKEN).toBe('ghs_minted');
+    expect(vars.GIT_AUTHOR_NAME).toBe('animus[bot]');
+    expect(vars.GIT_AUTHOR_EMAIL).toBe('999+animus[bot]@users.noreply.github.com');
+    expect(vars.GIT_COMMITTER_EMAIL).toBe('999+animus[bot]@users.noreply.github.com');
+    expect(calls.some((c) => c.url.endsWith('/repos/o/r/installation'))).toBe(true);
+    expect(calls.some((c) => c.method === 'POST' && c.url.endsWith('/app/installations/42/access_tokens'))).toBe(true);
+  });
+
+  it('githubAppCredentials skips when the app is not configured', async () => {
+    expect(
+      await githubAppCredentials({ repos: [{ url: 'https://github.com/o/r', primary: true }] }, {} as NodeJS.ProcessEnv, 1000),
+    ).toEqual({});
   });
 
   it('cloneCommands builds argv-array git clones (remote urls only)', () => {
