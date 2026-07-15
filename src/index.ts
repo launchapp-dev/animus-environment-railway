@@ -120,7 +120,28 @@ const plugin = defineEnvironmentPlugin({
   health: () => env.health(),
 });
 
-plugin.run().catch((err) => {
-  process.stderr.write(`[animus-environment-railway] fatal: ${String(err)}\n`);
-  process.exit(1);
-});
+// The daemon/runner that spawned us owns our lifecycle over stdio: when it
+// closes our stdin (shutdown RPC / eviction / parent exit) `plugin.run()`
+// resolves. Our in-process RelayServer's listening socket would otherwise keep
+// Node's event loop alive, orphaning this process still holding the fixed relay
+// port (reparented to init) so the NEXT run's plugin can't bind it. Close the
+// relay and exit explicitly on EOF and on SIGTERM/SIGINT so an orphan can never
+// accumulate on the port.
+let exiting = false;
+const shutdown = (code: number): void => {
+  if (exiting) return;
+  exiting = true;
+  void env
+    .close()
+    .catch(() => undefined)
+    .finally(() => process.exit(code));
+};
+process.on('SIGTERM', () => shutdown(0));
+process.on('SIGINT', () => shutdown(0));
+plugin.run().then(
+  () => shutdown(0),
+  (err) => {
+    process.stderr.write(`[animus-environment-railway] fatal: ${String(err)}\n`);
+    shutdown(1);
+  },
+);
