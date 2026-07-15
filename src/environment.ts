@@ -377,9 +377,20 @@ export async function githubAppCredentials(
       installId = install.id;
       installAppId = install.app_id;
     } else {
-      const installs = await gh<Array<{ id: unknown; app_id: unknown }>>(`/app/installations`);
+      const installs = await gh<Array<{ id: unknown; app_id: unknown; account?: { login?: unknown } }>>(
+        `/app/installations`,
+      );
       const first = Array.isArray(installs) ? installs[0] : undefined;
       if (!first) return {};
+      if (Array.isArray(installs) && installs.length > 1) {
+        const chosen = typeof first.account?.login === 'string' ? first.account.login : String(first.id);
+        process.stderr.write(
+          `[animus-environment-railway] GitHub App has ${installs.length} installations; ` +
+            `no GITHUB_APP_INSTALLATION_ID and no target repo, so guessing the FIRST one ('${chosen}'). ` +
+            `The minted token is scoped to that org and will 403 on any other. ` +
+            `Set GITHUB_APP_INSTALLATION_ID or pass a target repo (spec.repos primary or spec.metadata.github_repo) to scope it deterministically.\n`,
+        );
+      }
       installId = first.id;
       installAppId = first.app_id;
     }

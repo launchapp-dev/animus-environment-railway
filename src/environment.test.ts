@@ -273,6 +273,53 @@ describe('pure helpers', () => {
     expect(tokenPost?.body).not.toContain('repositories');
   });
 
+  it('githubAppCredentials warns and uses installs[0] when the app has multiple installations', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const posts: Array<{ url: string }> = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (init?.method === 'POST') posts.push({ url: u });
+      const body = u.endsWith('/app/installations')
+        ? [
+            { id: 42, app_id: 7, account: { login: 'animus-ecosystem' } },
+            { id: 99, app_id: 7, account: { login: 'launchapp-dev' } },
+          ]
+        : u.endsWith('/access_tokens')
+          ? { token: 'ghs_first' }
+          : null;
+      return { ok: body !== null, status: body ? 200 : 404, json: async () => body, text: async () => 'x' } as Response;
+    }) as typeof fetch;
+
+    const warnings: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      warnings.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    let vars: Record<string, string>;
+    try {
+      vars = await githubAppCredentials(
+        { repos: [] },
+        { GITHUB_APP_ID: '7', GITHUB_APP_PRIVATE_KEY: pem } as NodeJS.ProcessEnv,
+        1000,
+        fetchImpl,
+      );
+    } finally {
+      process.stderr.write = origWrite;
+    }
+
+    // Behavior unchanged: still mints against the first installation.
+    expect(vars.GITHUB_TOKEN).toBe('ghs_first');
+    expect(posts.some((p) => p.url.endsWith('/app/installations/42/access_tokens'))).toBe(true);
+    // But a clear warning names the chosen org, the count, and the remedy.
+    const warning = warnings.find((w) => w.includes('installations'));
+    expect(warning).toBeDefined();
+    expect(warning).toContain('2 installations');
+    expect(warning).toContain('animus-ecosystem');
+    expect(warning).toContain('GITHUB_APP_INSTALLATION_ID');
+  });
+
   it('githubAppCredentials scopes to spec.metadata.github_repo when repos are absent', async () => {
     const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
     const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
