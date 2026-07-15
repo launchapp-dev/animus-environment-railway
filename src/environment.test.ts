@@ -8,7 +8,7 @@
 // integration-pending: it skips with a clear message unless RAILWAY_TOKEN +
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
-import { generateKeyPairSync } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -392,6 +392,34 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
     await env.teardown(handle); // second teardown: no throw
     expect(fake.deleted).toHaveLength(2); // delete is re-issued; the API treats missing as success
+  });
+
+  it('names the service DETERMINISTICALLY from a broker run id', async () => {
+    const { env, fake } = await makeEnv();
+    const runId = 'run-abc-123';
+    const expected = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', runId])).digest('hex').slice(0, 12);
+    const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: runId } } });
+    expect(fake.created[0].name).toBe(expected);
+    expect(expected.length).toBeLessThanOrEqual(26);
+    expect((handle.metadata as Record<string, unknown>).animus_run_id).toBe(runId);
+    await env.teardown(handle);
+  });
+
+  it('teardown cold-deletes by run id when the handle has no service_id', async () => {
+    const { env, fake } = await makeEnv();
+    const runId = 'run-xyz-789';
+    const name = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', runId])).digest('hex').slice(0, 12);
+    fake.listed = [
+      { id: 'svc-match', name },
+      { id: 'svc-other', name: `${SERVICE_NAME_PREFIX}unrelated` },
+    ];
+    // A run-id-only handle: no service_id (the caller never received the full handle).
+    await env.teardown({
+      id: 'r-none',
+      workspace_root: '/workspace',
+      metadata: { animus_run_id: runId, project_id: 'proj-1', environment_id: 'env-1' },
+    });
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-match', environmentId: 'env-1' }]);
   });
 
   it('rolls back (delete + release) when the container never dials home', async () => {

@@ -11,7 +11,7 @@
 // and the in-container bridge spawns them with `shell: false`. The provision
 // (git clone / animus install) commands assembled here are argv arrays too.
 
-import { createSign, randomBytes } from 'node:crypto';
+import { createHash, createSign, randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import {
@@ -37,6 +37,27 @@ function shortId(prefix: string): string {
   return `${prefix}${randomBytes(3).toString('hex')}`;
 }
 
+/** The workflow run id a broker passes on `spec.metadata` so this plugin can
+ *  name the node DETERMINISTICALLY (same run -> same service name across plugin
+ *  processes), which makes a node reconcilable + cold-reapable by run id even
+ *  when a caller never received the returned handle. Absent => legacy per-run
+ *  random naming. Accepts either `animus_run_id` or `run_id`. */
+function specRunId(spec: { metadata?: unknown }): string | null {
+  const meta = (spec.metadata ?? {}) as Record<string, unknown>;
+  const raw = meta.animus_run_id ?? meta.run_id;
+  const runId = typeof raw === 'string' ? raw.trim() : '';
+  return runId.length > 0 ? runId : null;
+}
+
+/** Deterministic, Railway-valid service name for a run: `animus-run-<12 hex>`
+ *  (23 chars, under Railway's ~32-char limit). Scoped by project id so the same
+ *  run id in different projects never collides. No per-process `instanceId` —
+ *  determinism across processes is the whole point (reconcile + cold teardown). */
+function deterministicServiceName(projectId: string, runId: string): string {
+  const digest = createHash('sha256').update(JSON.stringify([projectId, runId])).digest('hex').slice(0, 12);
+  return `${SERVICE_NAME_PREFIX}${digest}`;
+}
+
 /** Default base image when `EnvironmentSpec.image` is unset. */
 export const DEFAULT_IMAGE = process.env.ANIMUS_ENV_RAILWAY_IMAGE ?? 'ghcr.io/launchapp-dev/animus:v0.7.0-rc.2';
 
@@ -57,6 +78,10 @@ export interface RailwayHandleMeta {
   image: string;
   /** Primary repo subdir under the workspace root (multi-repo default cwd). */
   primary_subdir?: string | null;
+  /** The broker run id this node was named from, if any. Lets `teardown`
+   *  cold-delete by deterministic name when a caller only has the run id (e.g.
+   *  the daemon persisted the run id but crashed before recording service_id). */
+  animus_run_id?: string | null;
 }
 
 export interface RailwayEnvironmentConfig {
@@ -412,8 +437,25 @@ export class RailwayEnvironment {
     const spec = req.spec;
     const { projectId, environmentId } = resolveTarget(spec, this.config);
     const image = spec.image?.trim() || DEFAULT_IMAGE;
+    // A broker-supplied run id names the node deterministically (reconcilable +
+    // cold-reapable by run id); otherwise fall back to the per-run random id +
+    // per-instance prefix. The relay run id is kept random regardless so a repeat
+    // prepare for the same run never collides on an already-registered relay run.
+    const runId = specRunId(spec);
     const id = shortId('r');
-    const serviceName = `${this.instancePrefix()}${id}`;
+    const serviceName = runId ? deterministicServiceName(projectId, runId) : `${this.instancePrefix()}${id}`;
+    // Reconcile before create: any pre-existing service with this run's
+    // deterministic name is a leaked orphan from a failed earlier prepare of the
+    // SAME run (nothing else can own that name), so delete it first to keep the
+    // invariant "at most one service per run id" and avoid an accumulating leak.
+    if (runId) {
+      try {
+        const existing = (await this.railway().listRunServices(projectId)).find((s) => s.name === serviceName);
+        if (existing) await this.railway().deleteService(existing.id, environmentId);
+      } catch {
+        // Best-effort reconcile; a create below still proceeds.
+      }
+    }
 
     const relay = await this.relay();
     const { url, token } = relay.registerRun(id);
@@ -504,6 +546,7 @@ export class RailwayEnvironment {
       deployment_id: deploymentId ?? null,
       image,
       primary_subdir: plan.primarySubdir,
+      animus_run_id: runId,
     };
     return { handle: { id, workspace_root: WORKSPACE_ROOT, metadata } };
   }
@@ -537,14 +580,26 @@ export class RailwayEnvironment {
   async teardown(handle: EnvironmentHandle): Promise<void> {
     if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
     const meta = handle.metadata as RailwayHandleMeta | undefined;
-    if (!meta?.service_id) return;
-    const environmentId = meta.environment_id || this.config.environmentId;
-    if (!environmentId) {
-      throw new Error(
-        `cannot tear down service '${meta.service_id}': handle metadata has no environment_id and RAILWAY_ENVIRONMENT_ID is unset`,
-      );
+    const environmentId = meta?.environment_id || this.config.environmentId;
+    // Fast path: a full handle carries the service_id; delete it directly.
+    if (meta?.service_id) {
+      if (!environmentId) {
+        throw new Error(
+          `cannot tear down service '${meta.service_id}': handle metadata has no environment_id and RAILWAY_ENVIRONMENT_ID is unset`,
+        );
+      }
+      await this.railway().deleteService(meta.service_id, environmentId);
+      return;
     }
-    await this.railway().deleteService(meta.service_id, environmentId);
+    // Cold path: only a run id (no service_id) — resolve the service by its
+    // deterministic name and delete it. This closes the crash window where a
+    // service was created but the caller never received the full handle.
+    const runId = meta?.animus_run_id?.trim();
+    const projectId = meta?.project_id || this.config.projectId;
+    if (!runId || !projectId || !environmentId) return;
+    const serviceName = deterministicServiceName(projectId, runId);
+    const match = (await this.railway().listRunServices(projectId)).find((s) => s.name === serviceName);
+    if (match) await this.railway().deleteService(match.id, environmentId);
   }
 
   /** GC sweep: delete orphaned run services (no live relay registration).
