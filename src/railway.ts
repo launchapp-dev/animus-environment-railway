@@ -150,7 +150,14 @@ export class RailwayClient implements RailwayApi {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          authorization: `Bearer ${this.token}`,
+          // Railway PROJECT tokens (scoped to one project+environment — the
+          // preferred, least-privilege choice for a per-project ephemeral runner)
+          // authenticate via the `Project-Access-Token` header, NOT
+          // `Authorization: Bearer` (that returns "Not Authorized" for a project
+          // token; Bearer is for account/team tokens). Verified live against
+          // backboard.railway.com: serviceCreate/serviceDelete succeed with this
+          // header. Set RAILWAY_TOKEN to a project token from Project Settings → Tokens.
+          'project-access-token': this.token,
         },
         body: JSON.stringify(request),
       });

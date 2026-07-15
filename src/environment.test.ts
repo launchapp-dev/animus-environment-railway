@@ -8,7 +8,10 @@
 // integration-pending: it skips with a clear message unless RAILWAY_TOKEN +
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
+import { createHash, generateKeyPairSync } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -16,10 +19,14 @@ import { BridgeClient, RelayServer } from '@launchapp-dev/animus-env-transport';
 import { planWorkspace } from '@launchapp-dev/animus-environment-base';
 
 import {
+  claudeNodeCredentials,
   cloneCommands,
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
   DEFAULT_IMAGE,
+  githubAppCredentials,
+  harnessCredentialVars,
+  parseGithubSlug,
   RailwayEnvironment,
   resolveTarget,
   runVariables,
@@ -128,6 +135,169 @@ describe('pure helpers', () => {
     });
   });
 
+  it('harnessCredentialVars base64s the codex auth + passes the github token', () => {
+    const codexDir = mkdtempSync(join(tmpdir(), 'codex-'));
+    writeFileSync(join(codexDir, 'auth.json'), '{"tokens":"x"}');
+    const vars = harnessCredentialVars({ CODEX_OAUTH_HOME: codexDir, GITHUB_TOKEN: 'ghtok' } as NodeJS.ProcessEnv);
+    expect(Buffer.from(vars.ANIMUS_NODE_CODEX_AUTH_B64, 'base64').toString()).toBe('{"tokens":"x"}');
+    expect(vars.GITHUB_TOKEN).toBe('ghtok');
+  });
+
+  it('harnessCredentialVars skips missing creds (best-effort)', () => {
+    expect(harnessCredentialVars({ CODEX_OAUTH_HOME: '/nonexistent' } as NodeJS.ProcessEnv)).toEqual({});
+    expect(harnessCredentialVars({} as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('claudeNodeCredentials injects a valid token as-is with the refresh token STRIPPED', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    const now = 1_000_000;
+    writeFileSync(
+      join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'A', refreshToken: 'R', expiresAt: now + 3_600_000, scopes: ['x'] } }),
+    );
+    const vars = await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now, (async () => {
+      throw new Error('must not refresh a valid token');
+    }) as unknown as typeof fetch);
+    const injected = JSON.parse(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString());
+    expect(injected.claudeAiOauth.accessToken).toBe('A');
+    expect(injected.claudeAiOauth.refreshToken).toBeUndefined();
+    expect(injected.claudeAiOauth.scopes).toEqual(['x']);
+  });
+
+  it('claudeNodeCredentials refreshes an expired token, writes it back, and strips refresh', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    const path = join(dir, '.credentials.json');
+    const now = 1_000_000;
+    writeFileSync(path, JSON.stringify({ claudeAiOauth: { accessToken: 'old', refreshToken: 'R1', expiresAt: now - 1000 } }));
+    const fetchImpl = (async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ access_token: 'A2', refresh_token: 'R2', expires_in: 3600 }),
+      text: async () => '',
+    })) as unknown as typeof fetch;
+    const vars = await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now, fetchImpl);
+    const injected = JSON.parse(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString());
+    expect(injected.claudeAiOauth.accessToken).toBe('A2');
+    expect(injected.claudeAiOauth.refreshToken).toBeUndefined();
+    // rotated token written back to /data (so the daemon stays valid)
+    const onDisk = JSON.parse(readFileSync(path, 'utf8'));
+    expect(onDisk.claudeAiOauth.refreshToken).toBe('R2');
+    expect(onDisk.claudeAiOauth.accessToken).toBe('A2');
+  });
+
+  it('claudeNodeCredentials returns {} when refresh fails or no login', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    writeFileSync(join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'x', refreshToken: 'R', expiresAt: 1 } }));
+    const failing = (async () => ({ ok: false, status: 400, json: async () => ({}), text: async () => 'invalid_grant' })) as unknown as typeof fetch;
+    expect(await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, 1_000_000, failing)).toEqual({});
+    expect(await claudeNodeCredentials({} as NodeJS.ProcessEnv, 1_000_000)).toEqual({});
+  });
+
+  it('parseGithubSlug extracts owner/repo from https / ssh / .git urls', () => {
+    expect(parseGithubSlug('https://github.com/launchapp-dev/animus-cli.git')).toEqual({
+      owner: 'launchapp-dev',
+      repo: 'animus-cli',
+    });
+    expect(parseGithubSlug('https://github.com/o/r')).toEqual({ owner: 'o', repo: 'r' });
+    expect(parseGithubSlug('git@github.com:o/r.git')).toEqual({ owner: 'o', repo: 'r' });
+    expect(parseGithubSlug('/local/path')).toBeNull();
+    expect(parseGithubSlug(undefined)).toBeNull();
+  });
+
+  it('githubAppCredentials mints a repo-scoped token + bot identity (mocked GitHub)', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const calls: Array<{ url: string; method: string }> = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      calls.push({ url: u, method: init?.method ?? 'GET' });
+      const body = u.endsWith('/installation')
+        ? { id: 42, app_id: 7 }
+        : u.endsWith('/access_tokens')
+          ? { token: 'ghs_minted' }
+          : u.includes('/users/')
+            ? { id: 999 }
+            : null;
+      return { ok: body !== null, status: body ? 200 : 404, json: async () => body, text: async () => 'x' } as Response;
+    }) as typeof fetch;
+
+    const vars = await githubAppCredentials(
+      { repos: [{ url: 'https://github.com/o/r.git', primary: true }] },
+      { GITHUB_APP_ID: '7', GITHUB_APP_PRIVATE_KEY: pem, GITHUB_APP_SLUG: 'animus' } as NodeJS.ProcessEnv,
+      1000,
+      fetchImpl,
+    );
+    expect(vars.GITHUB_TOKEN).toBe('ghs_minted');
+    expect(vars.GIT_AUTHOR_NAME).toBe('animus[bot]');
+    expect(vars.GIT_AUTHOR_EMAIL).toBe('999+animus[bot]@users.noreply.github.com');
+    expect(vars.GIT_COMMITTER_EMAIL).toBe('999+animus[bot]@users.noreply.github.com');
+    expect(calls.some((c) => c.url.endsWith('/repos/o/r/installation'))).toBe(true);
+    expect(calls.some((c) => c.method === 'POST' && c.url.endsWith('/app/installations/42/access_tokens'))).toBe(true);
+  });
+
+  it('githubAppCredentials skips when the app is not configured', async () => {
+    expect(
+      await githubAppCredentials({ repos: [{ url: 'https://github.com/o/r', primary: true }] }, {} as NodeJS.ProcessEnv, 1000),
+    ).toEqual({});
+  });
+
+  it('githubAppCredentials mints an INSTALLATION-WIDE token on a bare node (no repos)', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const posts: Array<{ url: string; body: string }> = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (init?.method === 'POST') posts.push({ url: u, body: String(init?.body ?? '') });
+      const body = u.endsWith('/app/installations')
+        ? [{ id: 42, app_id: 7 }]
+        : u.endsWith('/access_tokens')
+          ? { token: 'ghs_wide' }
+          : u.includes('/users/')
+            ? { id: 999 }
+            : null;
+      return { ok: body !== null, status: body ? 200 : 404, json: async () => body, text: async () => 'x' } as Response;
+    }) as typeof fetch;
+
+    // Bare spec — exactly what the daemon broker prepares.
+    const vars = await githubAppCredentials(
+      { repos: [] },
+      { GITHUB_APP_ID: '7', GITHUB_APP_PRIVATE_KEY: pem, GITHUB_APP_SLUG: 'animus' } as NodeJS.ProcessEnv,
+      1000,
+      fetchImpl,
+    );
+    expect(vars.GITHUB_TOKEN).toBe('ghs_wide');
+    expect(vars.GIT_AUTHOR_NAME).toBe('animus[bot]');
+    // Installation-wide: minted against the first installation with NO repositories restriction.
+    const tokenPost = posts.find((p) => p.url.endsWith('/app/installations/42/access_tokens'));
+    expect(tokenPost).toBeDefined();
+    expect(tokenPost?.body).not.toContain('repositories');
+  });
+
+  it('githubAppCredentials scopes to spec.metadata.github_repo when repos are absent', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const calls: string[] = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      calls.push(u);
+      const body = u.endsWith('/installation')
+        ? { id: 55, app_id: 7 }
+        : u.endsWith('/access_tokens')
+          ? { token: 'ghs_scoped' }
+          : null;
+      return { ok: body !== null, status: body ? 200 : 404, json: async () => body, text: async () => 'x' } as Response;
+    }) as typeof fetch;
+
+    const vars = await githubAppCredentials(
+      { metadata: { github_repo: 'launchapp-dev/animus-cli' } },
+      { GITHUB_APP_ID: '7', GITHUB_APP_PRIVATE_KEY: pem } as NodeJS.ProcessEnv,
+      1000,
+      fetchImpl,
+    );
+    expect(vars.GITHUB_TOKEN).toBe('ghs_scoped');
+    expect(calls.some((u) => u.endsWith('/repos/launchapp-dev/animus-cli/installation'))).toBe(true);
+  });
+
   it('cloneCommands builds argv-array git clones (remote urls only)', () => {
     const plan = planWorkspace(
       {
@@ -228,7 +398,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const { env, fake } = await makeEnv();
 
     const { handle } = await env.prepare({ spec: { kind: 'railway', env: { RUN_FLAG: 'yes' } } });
-    expect(handle.id).toMatch(/^railway-/);
+    expect(handle.id).toMatch(/^r[0-9a-f]{6}$/);
     expect(handle.workspace_root).toBe(WORKSPACE_ROOT);
     const meta = handle.metadata as Record<string, unknown>;
     expect(meta.service_id).toBe('svc-1');
@@ -279,6 +449,34 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
     await env.teardown(handle); // second teardown: no throw
     expect(fake.deleted).toHaveLength(2); // delete is re-issued; the API treats missing as success
+  });
+
+  it('names the service DETERMINISTICALLY from a broker run id', async () => {
+    const { env, fake } = await makeEnv();
+    const runId = 'run-abc-123';
+    const expected = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', runId])).digest('hex').slice(0, 12);
+    const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: runId } } });
+    expect(fake.created[0].name).toBe(expected);
+    expect(expected.length).toBeLessThanOrEqual(26);
+    expect((handle.metadata as Record<string, unknown>).animus_run_id).toBe(runId);
+    await env.teardown(handle);
+  });
+
+  it('teardown cold-deletes by run id when the handle has no service_id', async () => {
+    const { env, fake } = await makeEnv();
+    const runId = 'run-xyz-789';
+    const name = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', runId])).digest('hex').slice(0, 12);
+    fake.listed = [
+      { id: 'svc-match', name },
+      { id: 'svc-other', name: `${SERVICE_NAME_PREFIX}unrelated` },
+    ];
+    // A run-id-only handle: no service_id (the caller never received the full handle).
+    await env.teardown({
+      id: 'r-none',
+      workspace_root: '/workspace',
+      metadata: { animus_run_id: runId, project_id: 'proj-1', environment_id: 'env-1' },
+    });
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-match', environmentId: 'env-1' }]);
   });
 
   it('rolls back (delete + release) when the container never dials home', async () => {

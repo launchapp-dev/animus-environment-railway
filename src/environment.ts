@@ -11,8 +11,10 @@
 // and the in-container bridge spawns them with `shell: false`. The provision
 // (git clone / animus install) commands assembled here are argv arrays too.
 
+import { createHash, createSign, randomBytes } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+
 import {
-  newHandleId,
   planWorkspace,
   provisionAnimus,
   type EnvironmentHandle,
@@ -25,6 +27,36 @@ import {
 import { RelayServer, type RelayServerOptions } from '@launchapp-dev/animus-env-transport';
 
 import { RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+
+// Short, Railway-valid id token: `<prefix><6 hex>`. The service name is
+// `animus-run-<instanceId>-<id>`, and Railway rejects long service names
+// (~32-char limit), so both the per-process instance id and the per-run id
+// must stay compact. 6 hex (2^24) is ample uniqueness for a project's
+// concurrent runs, and the GC sweep still matches by the shared prefix.
+function shortId(prefix: string): string {
+  return `${prefix}${randomBytes(3).toString('hex')}`;
+}
+
+/** The workflow run id a broker passes on `spec.metadata` so this plugin can
+ *  name the node DETERMINISTICALLY (same run -> same service name across plugin
+ *  processes), which makes a node reconcilable + cold-reapable by run id even
+ *  when a caller never received the returned handle. Absent => legacy per-run
+ *  random naming. Accepts either `animus_run_id` or `run_id`. */
+function specRunId(spec: { metadata?: unknown }): string | null {
+  const meta = (spec.metadata ?? {}) as Record<string, unknown>;
+  const raw = meta.animus_run_id ?? meta.run_id;
+  const runId = typeof raw === 'string' ? raw.trim() : '';
+  return runId.length > 0 ? runId : null;
+}
+
+/** Deterministic, Railway-valid service name for a run: `animus-run-<12 hex>`
+ *  (23 chars, under Railway's ~32-char limit). Scoped by project id so the same
+ *  run id in different projects never collides. No per-process `instanceId` —
+ *  determinism across processes is the whole point (reconcile + cold teardown). */
+function deterministicServiceName(projectId: string, runId: string): string {
+  const digest = createHash('sha256').update(JSON.stringify([projectId, runId])).digest('hex').slice(0, 12);
+  return `${SERVICE_NAME_PREFIX}${digest}`;
+}
 
 /** Default base image when `EnvironmentSpec.image` is unset. */
 export const DEFAULT_IMAGE = process.env.ANIMUS_ENV_RAILWAY_IMAGE ?? 'ghcr.io/launchapp-dev/animus:v0.7.0-rc.2';
@@ -46,6 +78,10 @@ export interface RailwayHandleMeta {
   image: string;
   /** Primary repo subdir under the workspace root (multi-repo default cwd). */
   primary_subdir?: string | null;
+  /** The broker run id this node was named from, if any. Lets `teardown`
+   *  cold-delete by deterministic name when a caller only has the run id (e.g.
+   *  the daemon persisted the run id but crashed before recording service_id). */
+  animus_run_id?: string | null;
 }
 
 export interface RailwayEnvironmentConfig {
@@ -142,6 +178,97 @@ export function cloneCommands(plan: WorkspacePlan): HarnessCommand[] {
   return commands;
 }
 
+const CLAUDE_OAUTH_TOKEN_URL =
+  process.env.CLAUDE_OAUTH_TOKEN_URL ?? 'https://console.anthropic.com/v1/oauth/token';
+const CLAUDE_OAUTH_CLIENT_ID = process.env.CLAUDE_OAUTH_CLIENT_ID ?? '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+/** Refresh the daemon `.credentials.json` this many ms before its access token
+ *  actually expires, so an in-flight node run never straddles the boundary. */
+const CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000;
+
+/** Read the daemon-side Codex auth.json + GitHub token and encode them for the
+ *  node bootstrap. Claude is handled separately (async central refresh). */
+export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const vars: Record<string, string> = {};
+  if (hostEnv.CODEX_OAUTH_HOME) {
+    try {
+      vars.ANIMUS_NODE_CODEX_AUTH_B64 = readFileSync(
+        `${hostEnv.CODEX_OAUTH_HOME.replace(/\/$/, '')}/auth.json`,
+      ).toString('base64');
+    } catch {
+      // no codex login on the daemon; skip
+    }
+  }
+  if (hostEnv.GITHUB_TOKEN) vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
+  return vars;
+}
+
+/** Central Claude-subscription refresher. A node must NEVER hold the refresh
+ *  token: the claude CLI rotates it single-use, and since a node's rotation is
+ *  lost (never written back to the daemon), a refreshing node would corrupt the
+ *  shared daemon credential after one run. So the DAEMON is the sole refresher —
+ *  it refreshes `.credentials.json` in place when the access token is near expiry
+ *  (writing the rotated token back), then injects only a short-lived access token
+ *  with the refresh token STRIPPED. The node uses that access token directly and
+ *  cannot rotate anything. Best-effort: returns {} when there is no login or the
+ *  refresh fails (the node then just has no claude auth). */
+export async function claudeNodeCredentials(
+  hostEnv: NodeJS.ProcessEnv,
+  now: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Record<string, string>> {
+  const dir = hostEnv.CLAUDE_CONFIG_DIR;
+  if (!dir) return {};
+  const path = `${dir.replace(/\/$/, '')}/.credentials.json`;
+  let file: Record<string, unknown>;
+  let oauth: Record<string, unknown>;
+  try {
+    file = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    oauth = (file.claudeAiOauth as Record<string, unknown>) ?? file;
+  } catch {
+    return {};
+  }
+  const expiresAt = Number(oauth.expiresAt ?? oauth.expires_at ?? 0);
+  const refreshToken = (oauth.refreshToken ?? oauth.refresh_token) as string | undefined;
+  if (expiresAt && expiresAt - now > CLAUDE_REFRESH_SKEW_MS) {
+    // Access token still valid: inject it as-is, minus the refresh token.
+    return { ANIMUS_NODE_CLAUDE_CREDENTIALS_B64: encodeNodeClaudeCreds(file, oauth) };
+  }
+  if (!refreshToken) return {};
+  try {
+    const res = await fetchImpl(CLAUDE_OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }),
+    });
+    if (!res.ok) {
+      process.stderr.write(
+        `[animus-environment-railway] claude token refresh failed (HTTP ${res.status}); node will lack claude auth\n`,
+      );
+      return {};
+    }
+    const t = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number };
+    const newExpiry = now + Number(t.expires_in ?? 28800) * 1000;
+    const refreshed = { ...oauth, accessToken: t.access_token, refreshToken: t.refresh_token ?? refreshToken, expiresAt: newExpiry };
+    // Write the rotated token back to the daemon so it (and the next run) stay valid.
+    try {
+      writeFileSync(path, JSON.stringify({ ...file, claudeAiOauth: refreshed }));
+    } catch {
+      // /data read-only in some environments; the injected token is still fresh
+    }
+    return { ANIMUS_NODE_CLAUDE_CREDENTIALS_B64: encodeNodeClaudeCreds(file, refreshed) };
+  } catch (err) {
+    process.stderr.write(`[animus-environment-railway] claude token refresh error: ${String(err)}\n`);
+    return {};
+  }
+}
+
+/** Build the base64 `.credentials.json` injected into the node: the fresh oauth
+ *  block with the refresh token REMOVED (the node must not be able to rotate). */
+function encodeNodeClaudeCreds(file: Record<string, unknown>, oauth: Record<string, unknown>): string {
+  const { refreshToken: _r, refresh_token: _r2, ...noRefresh } = oauth;
+  return Buffer.from(JSON.stringify({ ...file, claudeAiOauth: noRefresh })).toString('base64');
+}
+
 /** The per-run variables injected into the created service's environment. */
 export function runVariables(args: {
   wssUrl: string;
@@ -155,11 +282,134 @@ export function runVariables(args: {
   // shared database endpoint the daemon itself uses.
   if (hostEnv.BASE_DB_URL) vars.BASE_DB_URL = hostEnv.BASE_DB_URL;
   Object.assign(vars, args.specEnv ?? {});
-  // Relay coordinates always win over spec env (they are the run's identity).
+  // Subscription creds + GitHub token win over spec env (they are the daemon's
+  // authoritative harness auth, base64'd for the run-image bootstrap).
+  Object.assign(vars, harnessCredentialVars(hostEnv));
+  // Relay coordinates always win (they are the run's identity).
   vars.ANIMUS_ENV_WSS_URL = args.wssUrl;
   vars.ANIMUS_ENV_RUN_TOKEN = args.token;
   vars.ANIMUS_ENV_WORKSPACE_ROOT = WORKSPACE_ROOT;
   return vars;
+}
+
+/** owner/repo parsed from a github remote url (https or ssh), or null. */
+export function parseGithubSlug(url: string | undefined): { owner: string; repo: string } | null {
+  if (!url) return null;
+  const m = url.match(/github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/i);
+  return m && m[1] && m[2] ? { owner: m[1], repo: m[2] } : null;
+}
+
+/** Sign a short-lived (<=10 min) GitHub App JWT (RS256) with the app private key. */
+function githubAppJwt(appId: string, privateKeyPem: string, now: number): string {
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const data = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iat: now - 60, exp: now + 540, iss: appId })}`;
+  const sig = createSign('RSA-SHA256').update(data).sign(privateKeyPem, 'base64url');
+  return `${data}.${sig}`;
+}
+
+/** Resolve the repo slug to SCOPE the App token to: the run's primary repo, else a
+ *  broker-supplied `spec.metadata.github_repo` (a clone URL or a bare `owner/repo`).
+ *  Null => no specific repo (a bare broker node) — the caller mints an
+ *  installation-wide token instead. */
+function tokenScopeSlug(spec: {
+  repos?: Array<{ url: string; primary?: boolean }>;
+  metadata?: unknown;
+}): { owner: string; repo: string } | null {
+  const fromRepos = parseGithubSlug((spec.repos ?? []).find((r) => r.primary)?.url ?? spec.repos?.[0]?.url);
+  if (fromRepos) return fromRepos;
+  const meta = (spec.metadata ?? {}) as Record<string, unknown>;
+  const raw = typeof meta.github_repo === 'string' ? meta.github_repo.trim() : '';
+  if (!raw) return null;
+  const fromUrl = parseGithubSlug(raw);
+  if (fromUrl) return fromUrl;
+  const bare = raw.match(/^([^/\s]+)\/([^/\s]+?)(?:\.git)?$/);
+  return bare && bare[1] && bare[2] ? { owner: bare[1], repo: bare[2] } : null;
+}
+
+/** Mint a GitHub App installation token so the node's harness can push + open PRs
+ *  AS the app (not a personal account), plus the app's bot commit identity.
+ *
+ *  Scope: when a target repo is known (`spec.repos` primary or
+ *  `spec.metadata.github_repo`) the token is scoped to THAT repo. On a BARE broker
+ *  node (no repos — cloning is the harness's job) it falls back to an
+ *  installation-wide token (all repos the app is installed on), resolved from
+ *  `GITHUB_APP_INSTALLATION_ID` or the app's first installation — so a shared
+ *  per-run node can still push whatever repo the harness self-clones.
+ *
+ *  Best-effort: returns {} when the app is not configured or any GitHub call fails
+ *  (the node then just has no push credential). */
+export async function githubAppCredentials(
+  spec: { repos?: Array<{ url: string; primary?: boolean }>; metadata?: unknown },
+  hostEnv: NodeJS.ProcessEnv,
+  now: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Record<string, string>> {
+  const appId = hostEnv.GITHUB_APP_ID;
+  const rawKey = hostEnv.GITHUB_APP_PRIVATE_KEY;
+  if (!appId || !rawKey) return {};
+  const slug = tokenScopeSlug(spec);
+  const privateKey = rawKey.includes('\\n') ? rawKey.replace(/\\n/g, '\n') : rawKey;
+  try {
+    const jwt = githubAppJwt(appId, privateKey, now);
+    const gh = async <T = Record<string, unknown>>(path: string, init?: RequestInit): Promise<T> => {
+      const res = await fetchImpl(`https://api.github.com${path}`, {
+        ...init,
+        headers: {
+          authorization: `Bearer ${jwt}`,
+          accept: 'application/vnd.github+json',
+          'user-agent': 'animus-environment-railway',
+          ...init?.headers,
+        },
+      });
+      if (!res.ok) throw new Error(`GitHub ${path} -> HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      return (await res.json()) as T;
+    };
+    // Resolve the installation: repo-scoped when a target repo is known, else the
+    // app's own installation (env override, else the first one).
+    let installId: unknown;
+    let installAppId: unknown;
+    if (slug) {
+      const install = await gh(`/repos/${slug.owner}/${slug.repo}/installation`);
+      installId = install.id;
+      installAppId = install.app_id;
+    } else if (hostEnv.GITHUB_APP_INSTALLATION_ID) {
+      const install = await gh(`/app/installations/${hostEnv.GITHUB_APP_INSTALLATION_ID}`);
+      installId = install.id;
+      installAppId = install.app_id;
+    } else {
+      const installs = await gh<Array<{ id: unknown; app_id: unknown }>>(`/app/installations`);
+      const first = Array.isArray(installs) ? installs[0] : undefined;
+      if (!first) return {};
+      installId = first.id;
+      installAppId = first.app_id;
+    }
+    const minted = await gh(`/app/installations/${installId}/access_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      // Scope to the one repo when known; otherwise an installation-wide token.
+      body: slug ? JSON.stringify({ repositories: [slug.repo] }) : '{}',
+    });
+    const vars: Record<string, string> = { GITHUB_TOKEN: String(minted.token) };
+    const appSlug = hostEnv.GITHUB_APP_SLUG;
+    if (appSlug) {
+      let botId: unknown = installAppId;
+      try {
+        botId = (await gh(`/users/${appSlug}[bot]`)).id;
+      } catch {
+        // fall back to app_id if the bot user lookup fails
+      }
+      const name = `${appSlug}[bot]`;
+      const email = `${botId}+${appSlug}[bot]@users.noreply.github.com`;
+      vars.GIT_AUTHOR_NAME = name;
+      vars.GIT_AUTHOR_EMAIL = email;
+      vars.GIT_COMMITTER_NAME = name;
+      vars.GIT_COMMITTER_EMAIL = email;
+    }
+    return vars;
+  } catch (err) {
+    process.stderr.write(`[animus-environment-railway] github app token mint failed: ${String(err)}\n`);
+    return {};
+  }
 }
 
 export interface RailwayEnvironmentDeps {
@@ -177,7 +427,7 @@ export class RailwayEnvironment {
   private relayInstance: RelayServer | null;
   /** Random per-process identity baked into service names, so a GC sweep can
    *  distinguish this instance's runs from another live plugin instance's. */
-  readonly instanceId: string = newHandleId('i');
+  readonly instanceId: string = shortId('i');
 
   constructor(deps: RailwayEnvironmentDeps = {}) {
     this.config = deps.config ?? configFromEnv();
@@ -232,8 +482,25 @@ export class RailwayEnvironment {
     const spec = req.spec;
     const { projectId, environmentId } = resolveTarget(spec, this.config);
     const image = spec.image?.trim() || DEFAULT_IMAGE;
-    const id = newHandleId('railway');
-    const serviceName = `${this.instancePrefix()}${id}`;
+    // A broker-supplied run id names the node deterministically (reconcilable +
+    // cold-reapable by run id); otherwise fall back to the per-run random id +
+    // per-instance prefix. The relay run id is kept random regardless so a repeat
+    // prepare for the same run never collides on an already-registered relay run.
+    const runId = specRunId(spec);
+    const id = shortId('r');
+    const serviceName = runId ? deterministicServiceName(projectId, runId) : `${this.instancePrefix()}${id}`;
+    // Reconcile before create: any pre-existing service with this run's
+    // deterministic name is a leaked orphan from a failed earlier prepare of the
+    // SAME run (nothing else can own that name), so delete it first to keep the
+    // invariant "at most one service per run id" and avoid an accumulating leak.
+    if (runId) {
+      try {
+        const existing = (await this.railway().listRunServices(projectId)).find((s) => s.name === serviceName);
+        if (existing) await this.railway().deleteService(existing.id, environmentId);
+      } catch {
+        // Best-effort reconcile; a create below still proceeds.
+      }
+    }
 
     const relay = await this.relay();
     const { url, token } = relay.registerRun(id);
@@ -260,13 +527,20 @@ export class RailwayEnvironment {
 
     let serviceId: string | null = null;
     let deploymentId: string | null | undefined;
+    // Mint a repo-scoped GitHub App token (+ bot commit identity) so the node's
+    // harness pushes + opens PRs AS the app. Best-effort; overrides any passthrough
+    // GITHUB_TOKEN from runVariables.
+    const appVars = await githubAppCredentials(spec, process.env, Math.floor(Date.now() / 1000));
+    // Central Claude refresh: inject a short-lived access token (refresh token
+    // stripped) so the node can't rotate/corrupt the shared daemon credential.
+    const claudeVars = await claudeNodeCredentials(process.env, Date.now());
     try {
       const created = await this.railway().createRunService({
         projectId,
         environmentId,
         name: serviceName,
         image,
-        variables: runVariables({ wssUrl: url, token, specEnv: spec.env }),
+        variables: { ...runVariables({ wssUrl: url, token, specEnv: spec.env }), ...claudeVars, ...appVars },
         startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
       });
       serviceId = created.serviceId;
@@ -317,6 +591,7 @@ export class RailwayEnvironment {
       deployment_id: deploymentId ?? null,
       image,
       primary_subdir: plan.primarySubdir,
+      animus_run_id: runId,
     };
     return { handle: { id, workspace_root: WORKSPACE_ROOT, metadata } };
   }
@@ -350,14 +625,26 @@ export class RailwayEnvironment {
   async teardown(handle: EnvironmentHandle): Promise<void> {
     if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
     const meta = handle.metadata as RailwayHandleMeta | undefined;
-    if (!meta?.service_id) return;
-    const environmentId = meta.environment_id || this.config.environmentId;
-    if (!environmentId) {
-      throw new Error(
-        `cannot tear down service '${meta.service_id}': handle metadata has no environment_id and RAILWAY_ENVIRONMENT_ID is unset`,
-      );
+    const environmentId = meta?.environment_id || this.config.environmentId;
+    // Fast path: a full handle carries the service_id; delete it directly.
+    if (meta?.service_id) {
+      if (!environmentId) {
+        throw new Error(
+          `cannot tear down service '${meta.service_id}': handle metadata has no environment_id and RAILWAY_ENVIRONMENT_ID is unset`,
+        );
+      }
+      await this.railway().deleteService(meta.service_id, environmentId);
+      return;
     }
-    await this.railway().deleteService(meta.service_id, environmentId);
+    // Cold path: only a run id (no service_id) — resolve the service by its
+    // deterministic name and delete it. This closes the crash window where a
+    // service was created but the caller never received the full handle.
+    const runId = meta?.animus_run_id?.trim();
+    const projectId = meta?.project_id || this.config.projectId;
+    if (!runId || !projectId || !environmentId) return;
+    const serviceName = deterministicServiceName(projectId, runId);
+    const match = (await this.railway().listRunServices(projectId)).find((s) => s.name === serviceName);
+    if (match) await this.railway().deleteService(match.id, environmentId);
   }
 
   /** GC sweep: delete orphaned run services (no live relay registration).

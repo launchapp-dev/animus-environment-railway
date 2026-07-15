@@ -1,6 +1,6 @@
 schema = "animus.plugin.v1"
 name = "animus-environment-railway"
-version = "0.1.0"
+version = "0.4.0"
 plugin_kind = "environment"
 description = "Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image via the Railway GraphQL API, relays harness commands over an outbound WebSocket the container dials home (animus-env-transport), and deletes the service on teardown."
 
@@ -63,4 +63,36 @@ required = false
 [[env]]
 key = "BASE_DB_URL"
 description = "When set on the daemon host, passed through into every run container (shared cloud database endpoint)."
+required = false
+
+[[env]]
+key = "CLAUDE_CONFIG_DIR"
+description = "Daemon-side dir with the Claude subscription .credentials.json; base64-injected into each node so the claude harness runs on the subscription."
+required = false
+
+[[env]]
+key = "CODEX_OAUTH_HOME"
+description = "Daemon-side dir with the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription."
+required = false
+
+[[env]]
+key = "GITHUB_TOKEN"
+description = "GitHub token injected into each node for git push + PR creation from the harness (fallback when no GitHub App is configured)."
+required = false
+sensitive = true
+
+[[env]]
+key = "GITHUB_APP_ID"
+description = "GitHub App id; with GITHUB_APP_PRIVATE_KEY, prepare mints a repo-scoped installation token so the node pushes + opens PRs as the app."
+required = false
+
+[[env]]
+key = "GITHUB_APP_PRIVATE_KEY"
+description = "GitHub App private key (PEM) used to sign the app JWT that mints the per-run installation token."
+required = false
+sensitive = true
+
+[[env]]
+key = "GITHUB_APP_SLUG"
+description = "GitHub App slug; sets the bot commit identity (<slug>[bot]) so commits are attributed to the app."
 required = false

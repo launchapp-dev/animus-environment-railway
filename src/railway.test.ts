@@ -116,7 +116,10 @@ describe('RailwayClient', () => {
     expect(calls).toHaveLength(3);
     expect(calls[0]?.url).toBe(RAILWAY_GQL_ENDPOINT);
     const headers = calls[0]?.init.headers as Record<string, string>;
-    expect(headers.authorization).toBe('Bearer tok-123');
+    // Railway PROJECT tokens auth via the Project-Access-Token header (verified
+    // live), not Authorization: Bearer.
+    expect(headers['project-access-token']).toBe('tok-123');
+    expect(headers.authorization).toBeUndefined();
     expect(headers['content-type']).toBe('application/json');
     expect(calls[0]?.body.query).toContain('serviceCreate');
     expect(calls[1]?.body.query).toContain('serviceInstanceUpdate');
