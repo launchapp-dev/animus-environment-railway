@@ -307,12 +307,39 @@ function githubAppJwt(appId: string, privateKeyPem: string, now: number): string
   return `${data}.${sig}`;
 }
 
-/** Mint a repo-scoped GitHub App installation token for the run's primary repo and
- *  return it + the app's bot commit identity (so pushes + PRs + commits are attributed
- *  to the App, not a personal account). Best-effort: returns {} when the app is not
- *  configured or any GitHub call fails (the node then just has no push credential). */
+/** Resolve the repo slug to SCOPE the App token to: the run's primary repo, else a
+ *  broker-supplied `spec.metadata.github_repo` (a clone URL or a bare `owner/repo`).
+ *  Null => no specific repo (a bare broker node) — the caller mints an
+ *  installation-wide token instead. */
+function tokenScopeSlug(spec: {
+  repos?: Array<{ url: string; primary?: boolean }>;
+  metadata?: unknown;
+}): { owner: string; repo: string } | null {
+  const fromRepos = parseGithubSlug((spec.repos ?? []).find((r) => r.primary)?.url ?? spec.repos?.[0]?.url);
+  if (fromRepos) return fromRepos;
+  const meta = (spec.metadata ?? {}) as Record<string, unknown>;
+  const raw = typeof meta.github_repo === 'string' ? meta.github_repo.trim() : '';
+  if (!raw) return null;
+  const fromUrl = parseGithubSlug(raw);
+  if (fromUrl) return fromUrl;
+  const bare = raw.match(/^([^/\s]+)\/([^/\s]+?)(?:\.git)?$/);
+  return bare && bare[1] && bare[2] ? { owner: bare[1], repo: bare[2] } : null;
+}
+
+/** Mint a GitHub App installation token so the node's harness can push + open PRs
+ *  AS the app (not a personal account), plus the app's bot commit identity.
+ *
+ *  Scope: when a target repo is known (`spec.repos` primary or
+ *  `spec.metadata.github_repo`) the token is scoped to THAT repo. On a BARE broker
+ *  node (no repos — cloning is the harness's job) it falls back to an
+ *  installation-wide token (all repos the app is installed on), resolved from
+ *  `GITHUB_APP_INSTALLATION_ID` or the app's first installation — so a shared
+ *  per-run node can still push whatever repo the harness self-clones.
+ *
+ *  Best-effort: returns {} when the app is not configured or any GitHub call fails
+ *  (the node then just has no push credential). */
 export async function githubAppCredentials(
-  spec: { repos?: Array<{ url: string; primary?: boolean }> },
+  spec: { repos?: Array<{ url: string; primary?: boolean }>; metadata?: unknown },
   hostEnv: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: typeof fetch = fetch,
@@ -320,12 +347,11 @@ export async function githubAppCredentials(
   const appId = hostEnv.GITHUB_APP_ID;
   const rawKey = hostEnv.GITHUB_APP_PRIVATE_KEY;
   if (!appId || !rawKey) return {};
-  const slug = parseGithubSlug((spec.repos ?? []).find((r) => r.primary)?.url ?? spec.repos?.[0]?.url);
-  if (!slug) return {};
+  const slug = tokenScopeSlug(spec);
   const privateKey = rawKey.includes('\\n') ? rawKey.replace(/\\n/g, '\n') : rawKey;
   try {
     const jwt = githubAppJwt(appId, privateKey, now);
-    const gh = async (path: string, init?: RequestInit): Promise<Record<string, unknown>> => {
+    const gh = async <T = Record<string, unknown>>(path: string, init?: RequestInit): Promise<T> => {
       const res = await fetchImpl(`https://api.github.com${path}`, {
         ...init,
         headers: {
@@ -336,18 +362,37 @@ export async function githubAppCredentials(
         },
       });
       if (!res.ok) throw new Error(`GitHub ${path} -> HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      return (await res.json()) as Record<string, unknown>;
+      return (await res.json()) as T;
     };
-    const install = await gh(`/repos/${slug.owner}/${slug.repo}/installation`);
-    const minted = await gh(`/app/installations/${install.id}/access_tokens`, {
+    // Resolve the installation: repo-scoped when a target repo is known, else the
+    // app's own installation (env override, else the first one).
+    let installId: unknown;
+    let installAppId: unknown;
+    if (slug) {
+      const install = await gh(`/repos/${slug.owner}/${slug.repo}/installation`);
+      installId = install.id;
+      installAppId = install.app_id;
+    } else if (hostEnv.GITHUB_APP_INSTALLATION_ID) {
+      const install = await gh(`/app/installations/${hostEnv.GITHUB_APP_INSTALLATION_ID}`);
+      installId = install.id;
+      installAppId = install.app_id;
+    } else {
+      const installs = await gh<Array<{ id: unknown; app_id: unknown }>>(`/app/installations`);
+      const first = Array.isArray(installs) ? installs[0] : undefined;
+      if (!first) return {};
+      installId = first.id;
+      installAppId = first.app_id;
+    }
+    const minted = await gh(`/app/installations/${installId}/access_tokens`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ repositories: [slug.repo] }),
+      // Scope to the one repo when known; otherwise an installation-wide token.
+      body: slug ? JSON.stringify({ repositories: [slug.repo] }) : '{}',
     });
     const vars: Record<string, string> = { GITHUB_TOKEN: String(minted.token) };
     const appSlug = hostEnv.GITHUB_APP_SLUG;
     if (appSlug) {
-      let botId: unknown = install.app_id;
+      let botId: unknown = installAppId;
       try {
         botId = (await gh(`/users/${appSlug}[bot]`)).id;
       } catch {

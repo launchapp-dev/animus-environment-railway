@@ -241,6 +241,63 @@ describe('pure helpers', () => {
     ).toEqual({});
   });
 
+  it('githubAppCredentials mints an INSTALLATION-WIDE token on a bare node (no repos)', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const posts: Array<{ url: string; body: string }> = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      if (init?.method === 'POST') posts.push({ url: u, body: String(init?.body ?? '') });
+      const body = u.endsWith('/app/installations')
+        ? [{ id: 42, app_id: 7 }]
+        : u.endsWith('/access_tokens')
+          ? { token: 'ghs_wide' }
+          : u.includes('/users/')
+            ? { id: 999 }
+            : null;
+      return { ok: body !== null, status: body ? 200 : 404, json: async () => body, text: async () => 'x' } as Response;
+    }) as typeof fetch;
+
+    // Bare spec — exactly what the daemon broker prepares.
+    const vars = await githubAppCredentials(
+      { repos: [] },
+      { GITHUB_APP_ID: '7', GITHUB_APP_PRIVATE_KEY: pem, GITHUB_APP_SLUG: 'animus' } as NodeJS.ProcessEnv,
+      1000,
+      fetchImpl,
+    );
+    expect(vars.GITHUB_TOKEN).toBe('ghs_wide');
+    expect(vars.GIT_AUTHOR_NAME).toBe('animus[bot]');
+    // Installation-wide: minted against the first installation with NO repositories restriction.
+    const tokenPost = posts.find((p) => p.url.endsWith('/app/installations/42/access_tokens'));
+    expect(tokenPost).toBeDefined();
+    expect(tokenPost?.body).not.toContain('repositories');
+  });
+
+  it('githubAppCredentials scopes to spec.metadata.github_repo when repos are absent', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pem = privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+    const calls: string[] = [];
+    const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+      const u = String(url);
+      calls.push(u);
+      const body = u.endsWith('/installation')
+        ? { id: 55, app_id: 7 }
+        : u.endsWith('/access_tokens')
+          ? { token: 'ghs_scoped' }
+          : null;
+      return { ok: body !== null, status: body ? 200 : 404, json: async () => body, text: async () => 'x' } as Response;
+    }) as typeof fetch;
+
+    const vars = await githubAppCredentials(
+      { metadata: { github_repo: 'launchapp-dev/animus-cli' } },
+      { GITHUB_APP_ID: '7', GITHUB_APP_PRIVATE_KEY: pem } as NodeJS.ProcessEnv,
+      1000,
+      fetchImpl,
+    );
+    expect(vars.GITHUB_TOKEN).toBe('ghs_scoped');
+    expect(calls.some((u) => u.endsWith('/repos/launchapp-dev/animus-cli/installation'))).toBe(true);
+  });
+
   it('cloneCommands builds argv-array git clones (remote urls only)', () => {
     const plan = planWorkspace(
       {
