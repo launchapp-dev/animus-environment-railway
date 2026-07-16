@@ -26,6 +26,8 @@ import {
 } from '@launchapp-dev/animus-environment-base';
 import {
   RelayServer,
+  PluginClient,
+  makeBackendCallHandler,
   type RelayServerOptions,
   type SessionResult,
   type JournalEventParams,
@@ -110,6 +112,14 @@ export interface RailwayEnvironmentConfig {
   /** Pull credentials for a private run image (ghcr et al). Both parts must be
    *  present to be applied; omitted for public images. */
   registryCredentials?: { username: string; password: string };
+  /** Parent-side backend plugin binary a node's `backend/call` is serviced
+   *  against (transparent passthrough — nested "animus inside animus"). When set
+   *  with a DATABASE_URL, the relay spawns it lazily and routes subject/config/
+   *  queue/journal role calls from lean nodes to it. */
+  upstreamBackendBin?: string;
+  /** DATABASE_URL handed to the parent-side backend plugin (kept on the PARENT;
+   *  never sent to the node). */
+  databaseUrl?: string;
   /** Extra TLS material for an in-process WSS listener. */
   tls?: RelayServerOptions['tls'];
 }
@@ -127,6 +137,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
       env.ANIMUS_ENV_REGISTRY_USERNAME && env.ANIMUS_ENV_REGISTRY_PASSWORD
         ? { username: env.ANIMUS_ENV_REGISTRY_USERNAME, password: env.ANIMUS_ENV_REGISTRY_PASSWORD }
         : undefined,
+    upstreamBackendBin: env.ANIMUS_ENV_UPSTREAM_BACKEND_BIN,
+    databaseUrl: env.BASE_DB_URL ?? env.DATABASE_URL,
   };
 }
 
@@ -452,10 +464,28 @@ export class RailwayEnvironment {
    *  distinguish this instance's runs from another live plugin instance's. */
   readonly instanceId: string = shortId('i');
 
+  private backendClient: PluginClient | null = null;
+
   constructor(deps: RailwayEnvironmentDeps = {}) {
     this.config = deps.config ?? configFromEnv();
     this.railwayApi = deps.railway ?? null;
     this.relayInstance = deps.relay ?? null;
+  }
+
+  /** Lazily spawn the parent-side backend plugin a node's `backend/call` is
+   *  serviced against. Returns null when upstream proxying isn't configured
+   *  (no backend bin + DATABASE_URL) so the relay's default reverse-RPC error
+   *  path stays in effect. The parent's DATABASE_URL is injected here and NEVER
+   *  sent to the node. */
+  private backend(): PluginClient | null {
+    if (this.backendClient) return this.backendClient;
+    const bin = this.config.upstreamBackendBin;
+    const dbUrl = this.config.databaseUrl;
+    if (!bin || !dbUrl) return null;
+    this.backendClient = new PluginClient(bin, {
+      env: { DATABASE_URL: dbUrl, BASE_DB_URL: dbUrl },
+    });
+    return this.backendClient;
   }
 
   /** Service-name prefix for THIS plugin instance's runs. */
@@ -487,11 +517,16 @@ export class RailwayEnvironment {
           'ANIMUS_ENV_RELAY_PUBLIC_URL is set but ANIMUS_ENV_RELAY_PORT is not — bind the relay to the port your public URL routes to',
         );
       }
+      const backend = this.backend();
       this.relayInstance = await RelayServer.listen({
         host: this.config.relayHost ?? '0.0.0.0',
         port: this.config.relayPort ?? 0,
         publicUrl: this.config.relayPublicUrl,
         tls: this.config.tls,
+        // Service a lean node's proxied backend roles against the parent's own
+        // animus-postgres (transparent passthrough); omitted → reverse RPC stays
+        // unwired and nodes fall back to their own local backends.
+        ...(backend ? { onReverseRpc: makeBackendCallHandler(backend) } : {}),
       });
     }
     return this.relayInstance;

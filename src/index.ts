@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.6',
+  version: '0.4.7',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -65,6 +65,19 @@ const plugin = defineEnvironmentPlugin({
       name: 'ANIMUS_ENV_REGISTRY_PASSWORD',
       description:
         'Registry password/token for pulling a private run image (e.g. a GitHub PAT with read:packages for ghcr). Injected into the Railway service so a private ANIMUS_ENV_RAILWAY_IMAGE can be pulled.',
+      required: false,
+      sensitive: true,
+    },
+    {
+      name: 'ANIMUS_ENV_UPSTREAM_BACKEND_BIN',
+      description:
+        "Path to the parent-side backend plugin (e.g. this project's animus-postgres) a lean node's backend/call is serviced against. Set together with DATABASE_URL to enable nested 'animus inside animus' state proxying; stays on the parent, never sent to the node.",
+      required: false,
+    },
+    {
+      name: 'DATABASE_URL',
+      description:
+        "Parent Postgres URL handed to ANIMUS_ENV_UPSTREAM_BACKEND_BIN so a node's proxied subject/config/queue/journal calls resolve against the parent DB. Never injected into the node.",
       required: false,
       sensitive: true,
     },
