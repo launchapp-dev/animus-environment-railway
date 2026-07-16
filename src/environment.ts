@@ -24,7 +24,12 @@ import {
   type PrepareRequest,
   type WorkspacePlan,
 } from '@launchapp-dev/animus-environment-base';
-import { RelayServer, type RelayServerOptions } from '@launchapp-dev/animus-env-transport';
+import {
+  RelayServer,
+  type RelayServerOptions,
+  type SessionResult,
+  type JournalEventParams,
+} from '@launchapp-dev/animus-env-transport';
 
 import { RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
 
@@ -629,6 +634,17 @@ export class RailwayEnvironment {
       timeoutSecs: timeoutSecs ?? null,
       onOutput: onChunk,
     });
+  }
+
+  /** `exec_session`: dispatch a subject to the container's OWN animus (REQ-052
+   *  remote-animus) and stream its journal events back via `onJournal`. */
+  async runSession(
+    handle: EnvironmentHandle,
+    params: { subject_id: string; workflow_ref?: string | null; dispatch_input?: string | null },
+    onJournal?: (event: JournalEventParams) => void,
+  ): Promise<SessionResult> {
+    const relay = await this.relay();
+    return relay.runSession(handle.id, params, onJournal);
   }
 
   /** `teardown`: delete the Railway service and release the relay run.

@@ -110,6 +110,26 @@ const plugin = defineEnvironmentPlugin({
       emit({ kind: 'output', handle_id: params.handle.id, stream, text });
     }),
 
+  execSession: async (params, emit) => {
+    const result = await env.runSession(
+      params.handle,
+      { subject_id: params.subject_id, workflow_ref: params.workflow_ref, dispatch_input: params.dispatch_input },
+      (ev) =>
+        emit({
+          kind: 'journal',
+          handle_id: params.handle.id,
+          workflow_id: ev.workflow_id ?? null,
+          event_kind: ev.kind,
+          phase_id: ev.phase_id ?? null,
+          status: ev.status ?? null,
+          ts: ev.ts,
+          payload: ev.payload,
+          terminal: ev.terminal ?? false,
+        }),
+    );
+    return { workflow_id: result.workflow_id, status: result.status };
+  },
+
   teardown: async (params) => {
     await env.teardown(params.handle);
     return {};
