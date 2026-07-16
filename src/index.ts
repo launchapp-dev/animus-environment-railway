@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.8',
+  version: '0.4.9',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -82,6 +82,12 @@ const plugin = defineEnvironmentPlugin({
       sensitive: true,
     },
     {
+      name: 'ANIMUS_ENV_UPSTREAM_LOG_BIN',
+      description:
+        "Path to the parent-side log-storage plugin (default /app/.animus/plugins/animus-log-storage-s3) a node's log_storage/* backend/call is serviced against, so run logs offload to the SAME bucket the daemon uses instead of animus-postgres. Wired only when the parent's S3 env (S3_BUCKET/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY, plus optional S3_ENDPOINT/S3_REGION/S3_PREFIX/S3_FORCE_PATH_STYLE) is present; those S3 vars are forwarded to the plugin and never sent to the node.",
+      required: false,
+    },
+    {
       name: 'ANIMUS_ENV_BRIDGE_COMMAND',
       description: 'Start command for the run container (default: animus-env-bridge).',
       required: false,
@@ -100,7 +106,7 @@ const plugin = defineEnvironmentPlugin({
     {
       name: 'CODEX_OAUTH_HOME',
       description:
-        'Daemon-side dir holding the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription.',
+        'Daemon-side dir holding the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription. Defaults to the durable portal path /data/animus-state/codex-config when unset, so codex works on nodes without extra portal config.',
       required: false,
     },
     {

@@ -75,6 +75,34 @@ export const WORKSPACE_ROOT = '/workspace';
  *  image does not ship it yet — see INTEGRATION.md. */
 export const DEFAULT_BRIDGE_COMMAND = 'animus-env-bridge';
 
+/** Default parent-side log-storage plugin a node's `log_storage/*` backend/call
+ *  is serviced against (its install path in the portal image). */
+export const DEFAULT_UPSTREAM_LOG_BIN = '/app/.animus/plugins/animus-log-storage-s3';
+
+/** S3 env vars the parent's log-storage-s3 plugin reads (see its plugin.toml
+ *  `env_required`): bucket + credentials are required, the rest optional. */
+const LOG_S3_ENV_KEYS = [
+  'S3_BUCKET',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+  'S3_ENDPOINT',
+  'S3_REGION',
+  'S3_PREFIX',
+  'S3_FORCE_PATH_STYLE',
+] as const;
+
+/** Collect the parent's S3 env (non-empty values only) to forward into the
+ *  lazily-spawned log servicer, so a node's proxied log writes land in the same
+ *  bucket the daemon itself uses. */
+export function logStorageEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of LOG_S3_ENV_KEYS) {
+    const value = env[key];
+    if (value !== undefined && value !== '') out[key] = value;
+  }
+  return out;
+}
+
 /** Metadata this plugin writes into `EnvironmentHandle.metadata`. */
 export interface RailwayHandleMeta {
   service_id: string;
@@ -120,6 +148,11 @@ export interface RailwayEnvironmentConfig {
   /** DATABASE_URL handed to the parent-side backend plugin (kept on the PARENT;
    *  never sent to the node). */
   databaseUrl?: string;
+  /** Parent-side log-storage plugin binary a node's `log_storage/*` backend/call
+   *  is serviced against (default `/app/.animus/plugins/animus-log-storage-s3`).
+   *  Wired only when the parent's S3 env (bucket + credentials) is present;
+   *  otherwise log calls fall back to the default backend. */
+  upstreamLogBin?: string;
   /** Extra TLS material for an in-process WSS listener. */
   tls?: RelayServerOptions['tls'];
 }
@@ -139,6 +172,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
         : undefined,
     upstreamBackendBin: env.ANIMUS_ENV_UPSTREAM_BACKEND_BIN,
     databaseUrl: env.BASE_DB_URL ?? env.DATABASE_URL,
+    upstreamLogBin: env.ANIMUS_ENV_UPSTREAM_LOG_BIN,
   };
 }
 
@@ -209,20 +243,30 @@ const CLAUDE_OAUTH_CLIENT_ID = process.env.CLAUDE_OAUTH_CLIENT_ID ?? '9d1c250a-e
  *  actually expires, so an in-flight node run never straddles the boundary. */
 const CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
+/** Durable dir the portal Connections flow stores the Codex ChatGPT-subscription
+ *  `auth.json` in (the portal's codex wrapper + start.sh default). Used when the
+ *  daemon env leaves `CODEX_OAUTH_HOME` unset so the node still gets codex auth
+ *  without any extra portal config. */
+export const DEFAULT_CODEX_OAUTH_HOME = '/data/animus-state/codex-config';
+
 /** Read the daemon-side Codex auth.json + GitHub token and encode them for the
  *  node bootstrap. Claude is handled separately (async central refresh). */
 export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
   const vars: Record<string, string> = {};
-  if (hostEnv.CODEX_OAUTH_HOME) {
-    try {
-      vars.ANIMUS_NODE_CODEX_AUTH_B64 = readFileSync(
-        `${hostEnv.CODEX_OAUTH_HOME.replace(/\/$/, '')}/auth.json`,
-      ).toString('base64');
-    } catch {
-      // no codex login on the daemon; skip
-    }
+  // Fall back to the durable portal default so codex works even when the daemon
+  // env does not export CODEX_OAUTH_HOME (best-effort: skips when absent).
+  const codexHome = (hostEnv.CODEX_OAUTH_HOME ?? DEFAULT_CODEX_OAUTH_HOME).replace(/\/$/, '');
+  try {
+    vars.ANIMUS_NODE_CODEX_AUTH_B64 = readFileSync(`${codexHome}/auth.json`).toString('base64');
+  } catch {
+    // no codex login on the daemon; skip
   }
-  if (hostEnv.GITHUB_TOKEN) vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
+  // Expose the token as BOTH GITHUB_TOKEN (git credential helper) and GH_TOKEN
+  // (what the `gh` CLI reads) so `gh pr create` authenticates on the node.
+  if (hostEnv.GITHUB_TOKEN) {
+    vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
+    vars.GH_TOKEN = hostEnv.GITHUB_TOKEN;
+  }
   return vars;
 }
 
@@ -424,7 +468,10 @@ export async function githubAppCredentials(
       // Scope to the one repo when known; otherwise an installation-wide token.
       body: slug ? JSON.stringify({ repositories: [slug.repo] }) : '{}',
     });
-    const vars: Record<string, string> = { GITHUB_TOKEN: String(minted.token) };
+    // Expose the minted token as BOTH GITHUB_TOKEN (git credential helper) and
+    // GH_TOKEN (what the `gh` CLI reads) so `gh pr create` works on the node.
+    const mintedToken = String(minted.token);
+    const vars: Record<string, string> = { GITHUB_TOKEN: mintedToken, GH_TOKEN: mintedToken };
     const appSlug = hostEnv.GITHUB_APP_SLUG;
     if (appSlug) {
       let botId: unknown = installAppId;
@@ -465,6 +512,7 @@ export class RailwayEnvironment {
   readonly instanceId: string = shortId('i');
 
   private backendClient: PluginClient | null = null;
+  private logClient: PluginClient | null = null;
 
   constructor(deps: RailwayEnvironmentDeps = {}) {
     this.config = deps.config ?? configFromEnv();
@@ -486,6 +534,23 @@ export class RailwayEnvironment {
       env: { DATABASE_URL: dbUrl, BASE_DB_URL: dbUrl },
     });
     return this.backendClient;
+  }
+
+  /** Lazily spawn the parent-side log-storage plugin a node's `log_storage/*`
+   *  backend/call is serviced against, so run logs offload to the SAME bucket the
+   *  daemon uses (instead of hitting animus-postgres). Returns null when the
+   *  parent's S3 env (bucket + credentials) is absent — log calls then fall back
+   *  to the default servicer. The S3 env is forwarded here and never sent to the
+   *  node. */
+  private logBackend(): PluginClient | null {
+    if (this.logClient) return this.logClient;
+    const bin = this.config.upstreamLogBin ?? DEFAULT_UPSTREAM_LOG_BIN;
+    const s3 = logStorageEnv();
+    // The plugin hard-requires bucket + credentials on initialize; skip wiring it
+    // when they are missing so a misconfigured parent degrades gracefully.
+    if (!bin || !s3.S3_BUCKET || !s3.S3_ACCESS_KEY_ID || !s3.S3_SECRET_ACCESS_KEY) return null;
+    this.logClient = new PluginClient(bin, { env: s3 });
+    return this.logClient;
   }
 
   /** Service-name prefix for THIS plugin instance's runs. */
@@ -518,15 +583,24 @@ export class RailwayEnvironment {
         );
       }
       const backend = this.backend();
+      const logBackend = this.logBackend();
       this.relayInstance = await RelayServer.listen({
         host: this.config.relayHost ?? '0.0.0.0',
         port: this.config.relayPort ?? 0,
         publicUrl: this.config.relayPublicUrl,
         tls: this.config.tls,
         // Service a lean node's proxied backend roles against the parent's own
-        // animus-postgres (transparent passthrough); omitted → reverse RPC stays
-        // unwired and nodes fall back to their own local backends.
-        ...(backend ? { onReverseRpc: makeBackendCallHandler(backend) } : {}),
+        // animus (transparent passthrough): log_storage/* → the parent's
+        // log-storage-s3 (same bucket as the daemon), everything else →
+        // animus-postgres. Omitted → reverse RPC stays unwired and nodes fall
+        // back to their own local backends.
+        ...(backend
+          ? {
+              onReverseRpc: makeBackendCallHandler(
+                logBackend ? { default: backend, log_storage: logBackend } : backend,
+              ),
+            }
+          : {}),
       });
     }
     return this.relayInstance;
@@ -789,11 +863,15 @@ export class RailwayEnvironment {
     return { status: 'healthy', uptime_ms: null, memory_usage_bytes: null, last_error: null };
   }
 
-  /** Close the relay listener (tests / shutdown). */
+  /** Close the relay listener + any parent-side backend plugins (tests / shutdown). */
   async close(): Promise<void> {
     if (this.relayInstance) {
       await this.relayInstance.close();
       this.relayInstance = null;
     }
+    this.backendClient?.close();
+    this.backendClient = null;
+    this.logClient?.close();
+    this.logClient = null;
   }
 }
