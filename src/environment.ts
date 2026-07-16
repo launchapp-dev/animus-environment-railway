@@ -107,6 +107,9 @@ export interface RailwayEnvironmentConfig {
   /** Bound wait for the container to dial home (default 300s — a Railway
    *  image pull + deploy is not fast). */
   dialTimeoutSecs?: number;
+  /** Pull credentials for a private run image (ghcr et al). Both parts must be
+   *  present to be applied; omitted for public images. */
+  registryCredentials?: { username: string; password: string };
   /** Extra TLS material for an in-process WSS listener. */
   tls?: RelayServerOptions['tls'];
 }
@@ -120,6 +123,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
     relayPort: env.ANIMUS_ENV_RELAY_PORT ? Number(env.ANIMUS_ENV_RELAY_PORT) : undefined,
     bridgeCommand: env.ANIMUS_ENV_BRIDGE_COMMAND,
     dialTimeoutSecs: env.ANIMUS_ENV_DIAL_TIMEOUT_SECS ? Number(env.ANIMUS_ENV_DIAL_TIMEOUT_SECS) : undefined,
+    registryCredentials:
+      env.ANIMUS_ENV_REGISTRY_USERNAME && env.ANIMUS_ENV_REGISTRY_PASSWORD
+        ? { username: env.ANIMUS_ENV_REGISTRY_USERNAME, password: env.ANIMUS_ENV_REGISTRY_PASSWORD }
+        : undefined,
   };
 }
 
@@ -558,6 +565,7 @@ export class RailwayEnvironment {
         image,
         variables: { ...runVariables({ wssUrl: url, token, specEnv: spec.env }), ...claudeVars, ...appVars },
         startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
+        registryCredentials: this.config.registryCredentials,
       });
       serviceId = created.serviceId;
       deploymentId = created.deploymentId;

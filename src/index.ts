@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.5',
+  version: '0.4.6',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -54,6 +54,19 @@ const plugin = defineEnvironmentPlugin({
       description:
         'Base image for run services (overrides the built-in default). Must ship the animus-env-bridge entrypoint.',
       required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_REGISTRY_USERNAME',
+      description:
+        'Registry username for pulling a private run image (e.g. a GitHub username for ghcr). Set together with ANIMUS_ENV_REGISTRY_PASSWORD; both required for the pull credentials to apply.',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_REGISTRY_PASSWORD',
+      description:
+        'Registry password/token for pulling a private run image (e.g. a GitHub PAT with read:packages for ghcr). Injected into the Railway service so a private ANIMUS_ENV_RAILWAY_IMAGE can be pulled.',
+      required: false,
+      sensitive: true,
     },
     {
       name: 'ANIMUS_ENV_BRIDGE_COMMAND',

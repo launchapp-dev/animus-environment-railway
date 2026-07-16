@@ -80,6 +80,22 @@ describe('request builders', () => {
       environmentId: 'env-1',
       input: { startCommand: 'animus-env-bridge' },
     });
+    expect((req.variables.input as Record<string, unknown>).registryCredentials).toBeUndefined();
+  });
+
+  it('serviceInstanceUpdate carries registry credentials for a private image', () => {
+    const req = buildServiceInstanceUpdateRequest({
+      serviceId: 'svc-1',
+      environmentId: 'env-1',
+      startCommand: 'animus-env-bridge',
+      registryCredentials: { username: 'bot', password: 'ghp_secret' },
+    });
+    expect(req.variables).toMatchObject({
+      input: {
+        startCommand: 'animus-env-bridge',
+        registryCredentials: { username: 'bot', password: 'ghp_secret' },
+      },
+    });
   });
 
   it('deploy / delete / list carry their ids', () => {

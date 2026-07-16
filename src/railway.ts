@@ -23,12 +23,22 @@ export interface GraphQLRequest {
   variables: Record<string, unknown>;
 }
 
+/** Private-registry pull credentials for the run image (ghcr et al). When the
+ *  base image is private, Railway needs these to pull it; omitted for public
+ *  images. */
+export interface RegistryCredentials {
+  username: string;
+  password: string;
+}
+
 export interface ServiceCreateInput {
   projectId: string;
   environmentId: string;
   name: string;
   image: string;
   variables: Record<string, string>;
+  /** Set when `image` lives in a private registry that needs auth to pull. */
+  registryCredentials?: RegistryCredentials;
 }
 
 export function buildServiceCreateRequest(input: ServiceCreateInput): GraphQLRequest {
@@ -52,7 +62,10 @@ export function buildServiceInstanceUpdateRequest(args: {
   serviceId: string;
   environmentId: string;
   startCommand: string;
+  registryCredentials?: RegistryCredentials;
 }): GraphQLRequest {
+  const input: Record<string, unknown> = { startCommand: args.startCommand };
+  if (args.registryCredentials) input.registryCredentials = args.registryCredentials;
   return {
     query: `mutation serviceInstanceUpdate($serviceId: String!, $environmentId: String, $input: ServiceInstanceUpdateInput!) {
   serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input)
@@ -60,7 +73,7 @@ export function buildServiceInstanceUpdateRequest(args: {
     variables: {
       serviceId: args.serviceId,
       environmentId: args.environmentId,
-      input: { startCommand: args.startCommand },
+      input,
     },
   };
 }
@@ -195,6 +208,7 @@ export class RailwayClient implements RailwayApi {
           serviceId,
           environmentId: input.environmentId,
           startCommand: input.startCommand,
+          registryCredentials: input.registryCredentials,
         }),
       );
       const deployed = await this.execute<{ serviceInstanceDeployV2?: string | null }>(
