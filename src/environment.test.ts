@@ -23,9 +23,11 @@ import {
   cloneCommands,
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
+  DEFAULT_CODEX_OAUTH_HOME,
   DEFAULT_IMAGE,
   githubAppCredentials,
   harnessCredentialVars,
+  logStorageEnv,
   parseGithubSlug,
   RailwayEnvironment,
   resolveTarget,
@@ -140,12 +142,19 @@ describe('pure helpers', () => {
     writeFileSync(join(codexDir, 'auth.json'), '{"tokens":"x"}');
     const vars = harnessCredentialVars({ CODEX_OAUTH_HOME: codexDir, GITHUB_TOKEN: 'ghtok' } as NodeJS.ProcessEnv);
     expect(Buffer.from(vars.ANIMUS_NODE_CODEX_AUTH_B64, 'base64').toString()).toBe('{"tokens":"x"}');
+    // The GitHub token is exposed as BOTH GITHUB_TOKEN and GH_TOKEN (gh CLI).
     expect(vars.GITHUB_TOKEN).toBe('ghtok');
+    expect(vars.GH_TOKEN).toBe('ghtok');
+  });
+
+  it('exposes the durable portal codex home as the default fallback', () => {
+    // harnessCredentialVars reads this path when the daemon env omits
+    // CODEX_OAUTH_HOME, so codex works on nodes without extra portal config.
+    expect(DEFAULT_CODEX_OAUTH_HOME).toBe('/data/animus-state/codex-config');
   });
 
   it('harnessCredentialVars skips missing creds (best-effort)', () => {
-    expect(harnessCredentialVars({ CODEX_OAUTH_HOME: '/nonexistent' } as NodeJS.ProcessEnv)).toEqual({});
-    expect(harnessCredentialVars({} as NodeJS.ProcessEnv)).toEqual({});
+    expect(harnessCredentialVars({ CODEX_OAUTH_HOME: '/nonexistent-codex-home' } as NodeJS.ProcessEnv)).toEqual({});
   });
 
   it('claudeNodeCredentials injects a valid token as-is with the refresh token STRIPPED', async () => {
@@ -228,6 +237,7 @@ describe('pure helpers', () => {
       fetchImpl,
     );
     expect(vars.GITHUB_TOKEN).toBe('ghs_minted');
+    expect(vars.GH_TOKEN).toBe('ghs_minted');
     expect(vars.GIT_AUTHOR_NAME).toBe('animus[bot]');
     expect(vars.GIT_AUTHOR_EMAIL).toBe('999+animus[bot]@users.noreply.github.com');
     expect(vars.GIT_COMMITTER_EMAIL).toBe('999+animus[bot]@users.noreply.github.com');
@@ -598,26 +608,10 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     }
   });
 
-  it('health flags a public URL without a fixed relay port as unhealthy', async () => {
-    const fake = new FakeRailway();
-    const env = new RailwayEnvironment({
-      railway: fake,
-      config: { projectId: 'p', environmentId: 'e', relayPublicUrl: 'wss://daemon.example.com' },
-    });
-    expect(env.health()).toMatchObject({
-      status: 'unhealthy',
-      last_error: expect.stringContaining('ANIMUS_ENV_RELAY_PORT'),
-    });
-  });
-
-  it('refuses an ephemeral relay port when a fixed public URL is configured', async () => {
-    const fake = new FakeRailway();
-    const env = new RailwayEnvironment({
-      railway: fake,
-      config: { projectId: 'p', environmentId: 'e', relayPublicUrl: 'wss://daemon.example.com' },
-    });
-    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/ANIMUS_ENV_RELAY_PORT/);
-  });
+  // NOTE: the public relay URL + port are now owned by the SINGLETON relay
+  // process (animus-env-relay), not this plugin — the two former tests that
+  // asserted this plugin binds/validates the port were removed with that move.
+  // The singleton's own port validation lives in relay-cli (env-transport).
 });
 
 // ---------------------------------------------------------------------------
@@ -651,4 +645,27 @@ describe.skipIf(!haveCreds)('railway environment (real Railway, integration-pend
       await env.close();
     }
   }, 600_000);
+});
+
+describe('logStorageEnv', () => {
+  it('collects the non-empty S3 vars the log-storage-s3 plugin reads', () => {
+    const env = {
+      S3_BUCKET: 'logs',
+      S3_ACCESS_KEY_ID: 'AK',
+      S3_SECRET_ACCESS_KEY: 'SK',
+      S3_ENDPOINT: 'https://s3.example',
+      S3_REGION: '',
+      OTHER: 'ignored',
+    } as unknown as NodeJS.ProcessEnv;
+    expect(logStorageEnv(env)).toEqual({
+      S3_BUCKET: 'logs',
+      S3_ACCESS_KEY_ID: 'AK',
+      S3_SECRET_ACCESS_KEY: 'SK',
+      S3_ENDPOINT: 'https://s3.example',
+    });
+  });
+
+  it('returns nothing when no S3 env is present', () => {
+    expect(logStorageEnv({} as NodeJS.ProcessEnv)).toEqual({});
+  });
 });

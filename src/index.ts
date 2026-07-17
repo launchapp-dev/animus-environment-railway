@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.4',
+  version: '0.4.10',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -56,6 +56,38 @@ const plugin = defineEnvironmentPlugin({
       required: false,
     },
     {
+      name: 'ANIMUS_ENV_REGISTRY_USERNAME',
+      description:
+        'Registry username for pulling a private run image (e.g. a GitHub username for ghcr). Set together with ANIMUS_ENV_REGISTRY_PASSWORD; both required for the pull credentials to apply.',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_REGISTRY_PASSWORD',
+      description:
+        'Registry password/token for pulling a private run image (e.g. a GitHub PAT with read:packages for ghcr). Injected into the Railway service so a private ANIMUS_ENV_RAILWAY_IMAGE can be pulled.',
+      required: false,
+      sensitive: true,
+    },
+    {
+      name: 'ANIMUS_ENV_UPSTREAM_BACKEND_BIN',
+      description:
+        "Path to the parent-side backend plugin (e.g. this project's animus-postgres) a lean node's backend/call is serviced against. Set together with DATABASE_URL to enable nested 'animus inside animus' state proxying; stays on the parent, never sent to the node.",
+      required: false,
+    },
+    {
+      name: 'DATABASE_URL',
+      description:
+        "Parent Postgres URL handed to ANIMUS_ENV_UPSTREAM_BACKEND_BIN so a node's proxied subject/config/queue/journal calls resolve against the parent DB. Never injected into the node.",
+      required: false,
+      sensitive: true,
+    },
+    {
+      name: 'ANIMUS_ENV_UPSTREAM_LOG_BIN',
+      description:
+        "Path to the parent-side log-storage plugin (default /app/.animus/plugins/animus-log-storage-s3) a node's log_storage/* backend/call is serviced against, so run logs offload to the SAME bucket the daemon uses instead of animus-postgres. Wired only when the parent's S3 env (S3_BUCKET/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY, plus optional S3_ENDPOINT/S3_REGION/S3_PREFIX/S3_FORCE_PATH_STYLE) is present; those S3 vars are forwarded to the plugin and never sent to the node.",
+      required: false,
+    },
+    {
       name: 'ANIMUS_ENV_BRIDGE_COMMAND',
       description: 'Start command for the run container (default: animus-env-bridge).',
       required: false,
@@ -74,7 +106,7 @@ const plugin = defineEnvironmentPlugin({
     {
       name: 'CODEX_OAUTH_HOME',
       description:
-        'Daemon-side dir holding the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription.',
+        'Daemon-side dir holding the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription. Defaults to the durable portal path /data/animus-state/codex-config when unset, so codex works on nodes without extra portal config.',
       required: false,
     },
     {
@@ -109,6 +141,26 @@ const plugin = defineEnvironmentPlugin({
     env.execCommand(params.handle, params.command, params.stdin, params.timeout_secs, (stream, text) => {
       emit({ kind: 'output', handle_id: params.handle.id, stream, text });
     }),
+
+  execSession: async (params, emit) => {
+    const result = await env.runSession(
+      params.handle,
+      { subject_id: params.subject_id, workflow_ref: params.workflow_ref, dispatch_input: params.dispatch_input },
+      (ev) =>
+        emit({
+          kind: 'journal',
+          handle_id: params.handle.id,
+          workflow_id: ev.workflow_id ?? null,
+          event_kind: ev.kind,
+          phase_id: ev.phase_id ?? null,
+          status: ev.status ?? null,
+          ts: ev.ts,
+          payload: ev.payload,
+          terminal: ev.terminal ?? false,
+        }),
+    );
+    return { workflow_id: result.workflow_id, status: result.status };
+  },
 
   teardown: async (params) => {
     await env.teardown(params.handle);

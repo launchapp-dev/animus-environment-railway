@@ -24,7 +24,25 @@ import {
   type PrepareRequest,
   type WorkspacePlan,
 } from '@launchapp-dev/animus-environment-base';
-import { RelayServer, type RelayServerOptions } from '@launchapp-dev/animus-env-transport';
+import {
+  RelayServer,
+  RelayClient,
+  PluginClient,
+  makeBackendCallHandler,
+  type RelayServerOptions,
+  type SessionResult,
+  type JournalEventParams,
+} from '@launchapp-dev/animus-env-transport';
+
+/** The relay surface `prepare`/`exec`/`teardown` drive, satisfied by BOTH the
+ *  in-process `RelayServer` (tests) and the `RelayClient` that talks to the
+ *  shared singleton (production). `registerRun` may be sync or async — callers
+ *  `await` it. */
+type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | 'registeredRuns' | 'close'> & {
+  registerRun(handleId?: string): { url: string; token: string } | Promise<{ url: string; token: string }>;
+  // RelayServer returns the connection, RelayClient returns void — callers ignore it.
+  waitForConnection(handleId: string, timeoutMs: number): Promise<unknown>;
+};
 
 import { RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
 
@@ -68,6 +86,34 @@ export const WORKSPACE_ROOT = '/workspace';
  *  image does not ship it yet — see INTEGRATION.md. */
 export const DEFAULT_BRIDGE_COMMAND = 'animus-env-bridge';
 
+/** Default parent-side log-storage plugin a node's `log_storage/*` backend/call
+ *  is serviced against (its install path in the portal image). */
+export const DEFAULT_UPSTREAM_LOG_BIN = '/app/.animus/plugins/animus-log-storage-s3';
+
+/** S3 env vars the parent's log-storage-s3 plugin reads (see its plugin.toml
+ *  `env_required`): bucket + credentials are required, the rest optional. */
+const LOG_S3_ENV_KEYS = [
+  'S3_BUCKET',
+  'S3_ACCESS_KEY_ID',
+  'S3_SECRET_ACCESS_KEY',
+  'S3_ENDPOINT',
+  'S3_REGION',
+  'S3_PREFIX',
+  'S3_FORCE_PATH_STYLE',
+] as const;
+
+/** Collect the parent's S3 env (non-empty values only) to forward into the
+ *  lazily-spawned log servicer, so a node's proxied log writes land in the same
+ *  bucket the daemon itself uses. */
+export function logStorageEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of LOG_S3_ENV_KEYS) {
+    const value = env[key];
+    if (value !== undefined && value !== '') out[key] = value;
+  }
+  return out;
+}
+
 /** Metadata this plugin writes into `EnvironmentHandle.metadata`. */
 export interface RailwayHandleMeta {
   service_id: string;
@@ -89,19 +135,39 @@ export interface RailwayEnvironmentConfig {
   projectId?: string;
   /** Railway environment within the project. */
   environmentId?: string;
-  /** Public WSS URL containers dial (TLS terminated at the Railway edge).
-   *  Required for real Railway runs; local tests dial the bound port. */
+  /** Public WSS URL containers dial (TLS terminated at the Railway edge). Now
+   *  owned by the SINGLETON relay (animus-env-relay); kept here only for the
+   *  legacy in-process `RelayServer` test path. */
   relayPublicUrl?: string;
-  /** Port the relay binds (default 0 = ephemeral; set a fixed port when the
-   *  daemon's service exposes it publicly). */
+  /** Port the relay binds. Now owned by the singleton relay; unused by the
+   *  client path. */
   relayPort?: number;
-  /** Host interface the relay binds (default 0.0.0.0). */
+  /** Host interface the relay binds. Now owned by the singleton relay. */
   relayHost?: string;
+  /** Unix socket the shared singleton relay (animus-env-relay) listens on; the
+   *  client dials it. Default {@link DEFAULT_RELAY_SOCK} inside `RelayClient`. */
+  relaySocketPath?: string;
   /** In-container start command (default `animus-env-bridge`). */
   bridgeCommand?: string;
   /** Bound wait for the container to dial home (default 300s — a Railway
    *  image pull + deploy is not fast). */
   dialTimeoutSecs?: number;
+  /** Pull credentials for a private run image (ghcr et al). Both parts must be
+   *  present to be applied; omitted for public images. */
+  registryCredentials?: { username: string; password: string };
+  /** Parent-side backend plugin binary a node's `backend/call` is serviced
+   *  against (transparent passthrough — nested "animus inside animus"). When set
+   *  with a DATABASE_URL, the relay spawns it lazily and routes subject/config/
+   *  queue/journal role calls from lean nodes to it. */
+  upstreamBackendBin?: string;
+  /** DATABASE_URL handed to the parent-side backend plugin (kept on the PARENT;
+   *  never sent to the node). */
+  databaseUrl?: string;
+  /** Parent-side log-storage plugin binary a node's `log_storage/*` backend/call
+   *  is serviced against (default `/app/.animus/plugins/animus-log-storage-s3`).
+   *  Wired only when the parent's S3 env (bucket + credentials) is present;
+   *  otherwise log calls fall back to the default backend. */
+  upstreamLogBin?: string;
   /** Extra TLS material for an in-process WSS listener. */
   tls?: RelayServerOptions['tls'];
 }
@@ -115,6 +181,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
     relayPort: env.ANIMUS_ENV_RELAY_PORT ? Number(env.ANIMUS_ENV_RELAY_PORT) : undefined,
     bridgeCommand: env.ANIMUS_ENV_BRIDGE_COMMAND,
     dialTimeoutSecs: env.ANIMUS_ENV_DIAL_TIMEOUT_SECS ? Number(env.ANIMUS_ENV_DIAL_TIMEOUT_SECS) : undefined,
+    registryCredentials:
+      env.ANIMUS_ENV_REGISTRY_USERNAME && env.ANIMUS_ENV_REGISTRY_PASSWORD
+        ? { username: env.ANIMUS_ENV_REGISTRY_USERNAME, password: env.ANIMUS_ENV_REGISTRY_PASSWORD }
+        : undefined,
+    upstreamBackendBin: env.ANIMUS_ENV_UPSTREAM_BACKEND_BIN,
+    databaseUrl: env.BASE_DB_URL ?? env.DATABASE_URL,
+    upstreamLogBin: env.ANIMUS_ENV_UPSTREAM_LOG_BIN,
+    relaySocketPath: env.ANIMUS_ENV_RELAY_SOCK,
   };
 }
 
@@ -185,20 +259,30 @@ const CLAUDE_OAUTH_CLIENT_ID = process.env.CLAUDE_OAUTH_CLIENT_ID ?? '9d1c250a-e
  *  actually expires, so an in-flight node run never straddles the boundary. */
 const CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
+/** Durable dir the portal Connections flow stores the Codex ChatGPT-subscription
+ *  `auth.json` in (the portal's codex wrapper + start.sh default). Used when the
+ *  daemon env leaves `CODEX_OAUTH_HOME` unset so the node still gets codex auth
+ *  without any extra portal config. */
+export const DEFAULT_CODEX_OAUTH_HOME = '/data/animus-state/codex-config';
+
 /** Read the daemon-side Codex auth.json + GitHub token and encode them for the
  *  node bootstrap. Claude is handled separately (async central refresh). */
 export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
   const vars: Record<string, string> = {};
-  if (hostEnv.CODEX_OAUTH_HOME) {
-    try {
-      vars.ANIMUS_NODE_CODEX_AUTH_B64 = readFileSync(
-        `${hostEnv.CODEX_OAUTH_HOME.replace(/\/$/, '')}/auth.json`,
-      ).toString('base64');
-    } catch {
-      // no codex login on the daemon; skip
-    }
+  // Fall back to the durable portal default so codex works even when the daemon
+  // env does not export CODEX_OAUTH_HOME (best-effort: skips when absent).
+  const codexHome = (hostEnv.CODEX_OAUTH_HOME ?? DEFAULT_CODEX_OAUTH_HOME).replace(/\/$/, '');
+  try {
+    vars.ANIMUS_NODE_CODEX_AUTH_B64 = readFileSync(`${codexHome}/auth.json`).toString('base64');
+  } catch {
+    // no codex login on the daemon; skip
   }
-  if (hostEnv.GITHUB_TOKEN) vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
+  // Expose the token as BOTH GITHUB_TOKEN (git credential helper) and GH_TOKEN
+  // (what the `gh` CLI reads) so `gh pr create` authenticates on the node.
+  if (hostEnv.GITHUB_TOKEN) {
+    vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
+    vars.GH_TOKEN = hostEnv.GITHUB_TOKEN;
+  }
   return vars;
 }
 
@@ -400,7 +484,10 @@ export async function githubAppCredentials(
       // Scope to the one repo when known; otherwise an installation-wide token.
       body: slug ? JSON.stringify({ repositories: [slug.repo] }) : '{}',
     });
-    const vars: Record<string, string> = { GITHUB_TOKEN: String(minted.token) };
+    // Expose the minted token as BOTH GITHUB_TOKEN (git credential helper) and
+    // GH_TOKEN (what the `gh` CLI reads) so `gh pr create` works on the node.
+    const mintedToken = String(minted.token);
+    const vars: Record<string, string> = { GITHUB_TOKEN: mintedToken, GH_TOKEN: mintedToken };
     const appSlug = hostEnv.GITHUB_APP_SLUG;
     if (appSlug) {
       let botId: unknown = installAppId;
@@ -426,7 +513,8 @@ export async function githubAppCredentials(
 export interface RailwayEnvironmentDeps {
   /** Railway API (mockable). Default: a `RailwayClient` over `RAILWAY_TOKEN`. */
   railway?: RailwayApi;
-  /** Pre-started relay (tests). Default: lazily `RelayServer.listen(...)`. */
+  /** Pre-started in-process relay (tests). Default: connect to the shared
+   *  singleton via `RelayClient`. */
   relay?: RelayServer;
   config?: RailwayEnvironmentConfig;
 }
@@ -435,15 +523,51 @@ export interface RailwayEnvironmentDeps {
 export class RailwayEnvironment {
   private readonly config: RailwayEnvironmentConfig;
   private railwayApi: RailwayApi | null;
-  private relayInstance: RelayServer | null;
+  private relayInstance: RelayTransport | null;
   /** Random per-process identity baked into service names, so a GC sweep can
    *  distinguish this instance's runs from another live plugin instance's. */
   readonly instanceId: string = shortId('i');
+
+  private backendClient: PluginClient | null = null;
+  private logClient: PluginClient | null = null;
 
   constructor(deps: RailwayEnvironmentDeps = {}) {
     this.config = deps.config ?? configFromEnv();
     this.railwayApi = deps.railway ?? null;
     this.relayInstance = deps.relay ?? null;
+  }
+
+  /** Lazily spawn the parent-side backend plugin a node's `backend/call` is
+   *  serviced against. Returns null when upstream proxying isn't configured
+   *  (no backend bin + DATABASE_URL) so the relay's default reverse-RPC error
+   *  path stays in effect. The parent's DATABASE_URL is injected here and NEVER
+   *  sent to the node. */
+  private backend(): PluginClient | null {
+    if (this.backendClient) return this.backendClient;
+    const bin = this.config.upstreamBackendBin;
+    const dbUrl = this.config.databaseUrl;
+    if (!bin || !dbUrl) return null;
+    this.backendClient = new PluginClient(bin, {
+      env: { DATABASE_URL: dbUrl, BASE_DB_URL: dbUrl },
+    });
+    return this.backendClient;
+  }
+
+  /** Lazily spawn the parent-side log-storage plugin a node's `log_storage/*`
+   *  backend/call is serviced against, so run logs offload to the SAME bucket the
+   *  daemon uses (instead of hitting animus-postgres). Returns null when the
+   *  parent's S3 env (bucket + credentials) is absent — log calls then fall back
+   *  to the default servicer. The S3 env is forwarded here and never sent to the
+   *  node. */
+  private logBackend(): PluginClient | null {
+    if (this.logClient) return this.logClient;
+    const bin = this.config.upstreamLogBin ?? DEFAULT_UPSTREAM_LOG_BIN;
+    const s3 = logStorageEnv();
+    // The plugin hard-requires bucket + credentials on initialize; skip wiring it
+    // when they are missing so a misconfigured parent degrades gracefully.
+    if (!bin || !s3.S3_BUCKET || !s3.S3_ACCESS_KEY_ID || !s3.S3_SECRET_ACCESS_KEY) return null;
+    this.logClient = new PluginClient(bin, { env: s3 });
+    return this.logClient;
   }
 
   /** Service-name prefix for THIS plugin instance's runs. */
@@ -465,21 +589,27 @@ export class RailwayEnvironment {
   }
 
   /** Lazily bind the relay listener (one per plugin process, shared by runs). */
-  async relay(): Promise<RelayServer> {
+  async relay(): Promise<RelayTransport> {
     if (!this.relayInstance) {
-      if (this.config.relayPublicUrl && !this.config.relayPort) {
-        // A fixed public URL implies the edge routes to a KNOWN port; binding
-        // an ephemeral one would leave every container dialing a URL that
-        // routes nowhere (prepare would always time out and roll back).
-        throw new Error(
-          'ANIMUS_ENV_RELAY_PUBLIC_URL is set but ANIMUS_ENV_RELAY_PORT is not — bind the relay to the port your public URL routes to',
-        );
-      }
-      this.relayInstance = await RelayServer.listen({
-        host: this.config.relayHost ?? '0.0.0.0',
-        port: this.config.relayPort ?? 0,
-        publicUrl: this.config.relayPublicUrl,
-        tls: this.config.tls,
+      const backend = this.backend();
+      const logBackend = this.logBackend();
+      // Connect to the SHARED singleton relay (animus-env-relay) over its unix
+      // socket rather than binding the public port here — one relay owns the
+      // fixed port; every plugin instance is a client (no EADDRINUSE, no leaked
+      // listener, concurrent delegations multiplex by handleId). Reverse-RPC is
+      // still serviced HERE against the parent's own animus (transparent
+      // passthrough): log_storage/* → the parent's log-storage-s3 (same bucket as
+      // the daemon), everything else → animus-postgres. Omitted → reverse RPC
+      // stays unwired and nodes fall back to their own local backends.
+      this.relayInstance = await RelayClient.connect({
+        socketPath: this.config.relaySocketPath,
+        ...(backend
+          ? {
+              onReverseRpc: makeBackendCallHandler(
+                logBackend ? { default: backend, log_storage: logBackend } : backend,
+              ),
+            }
+          : {}),
       });
     }
     return this.relayInstance;
@@ -514,7 +644,7 @@ export class RailwayEnvironment {
     }
 
     const relay = await this.relay();
-    const { url, token } = relay.registerRun(id);
+    const { url, token } = await relay.registerRun(id);
     const plan = planWorkspace(spec, WORKSPACE_ROOT);
     // Validate every planned subdir up front (a spec-supplied repo `name` like
     // `../outside` must never escape the workspace root or poison the default
@@ -553,6 +683,7 @@ export class RailwayEnvironment {
         image,
         variables: { ...runVariables({ wssUrl: url, token, specEnv: spec.env }), ...claudeVars, ...appVars },
         startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
+        registryCredentials: this.config.registryCredentials,
       });
       serviceId = created.serviceId;
       deploymentId = created.deploymentId;
@@ -631,6 +762,17 @@ export class RailwayEnvironment {
     });
   }
 
+  /** `exec_session`: dispatch a subject to the container's OWN animus (REQ-052
+   *  remote-animus) and stream its journal events back via `onJournal`. */
+  async runSession(
+    handle: EnvironmentHandle,
+    params: { subject_id: string; workflow_ref?: string | null; dispatch_input?: string | null },
+    onJournal?: (event: JournalEventParams) => void,
+  ): Promise<SessionResult> {
+    const relay = await this.relay();
+    return relay.runSession(handle.id, params, onJournal);
+  }
+
   /** `teardown`: delete the Railway service and release the relay run.
    *  Idempotent — a missing service or unknown handle is a successful no-op. */
   async teardown(handle: EnvironmentHandle): Promise<void> {
@@ -704,21 +846,12 @@ export class RailwayEnvironment {
         last_error: 'railway environment is not configured: missing RAILWAY_TOKEN',
       };
     }
-    // A public URL without a fixed relay port makes every real prepare fail
-    // (see relay()); that is a hard misconfiguration, surface it at preflight.
-    if (this.config.relayPublicUrl && !this.config.relayPort) {
-      return {
-        status: 'unhealthy',
-        uptime_ms: null,
-        memory_usage_bytes: null,
-        last_error:
-          'ANIMUS_ENV_RELAY_PUBLIC_URL is set but ANIMUS_ENV_RELAY_PORT is not — the relay must bind the port the public URL routes to',
-      };
-    }
+    // The public URL + port are now owned by the singleton relay
+    // (animus-env-relay), whose own health surfaces a misconfigured port; this
+    // plugin only needs to reach that relay's unix socket at prepare time.
     const soft: string[] = [];
     if (!this.config.projectId) soft.push('RAILWAY_PROJECT_ID');
     if (!this.config.environmentId) soft.push('RAILWAY_ENVIRONMENT_ID');
-    if (!this.config.relayPublicUrl) soft.push('ANIMUS_ENV_RELAY_PUBLIC_URL');
     if (soft.length > 0) {
       return {
         status: 'degraded',
@@ -730,11 +863,15 @@ export class RailwayEnvironment {
     return { status: 'healthy', uptime_ms: null, memory_usage_bytes: null, last_error: null };
   }
 
-  /** Close the relay listener (tests / shutdown). */
+  /** Close the relay listener + any parent-side backend plugins (tests / shutdown). */
   async close(): Promise<void> {
     if (this.relayInstance) {
       await this.relayInstance.close();
       this.relayInstance = null;
     }
+    this.backendClient?.close();
+    this.backendClient = null;
+    this.logClient?.close();
+    this.logClient = null;
   }
 }
