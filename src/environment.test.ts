@@ -608,26 +608,10 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     }
   });
 
-  it('health flags a public URL without a fixed relay port as unhealthy', async () => {
-    const fake = new FakeRailway();
-    const env = new RailwayEnvironment({
-      railway: fake,
-      config: { projectId: 'p', environmentId: 'e', relayPublicUrl: 'wss://daemon.example.com' },
-    });
-    expect(env.health()).toMatchObject({
-      status: 'unhealthy',
-      last_error: expect.stringContaining('ANIMUS_ENV_RELAY_PORT'),
-    });
-  });
-
-  it('refuses an ephemeral relay port when a fixed public URL is configured', async () => {
-    const fake = new FakeRailway();
-    const env = new RailwayEnvironment({
-      railway: fake,
-      config: { projectId: 'p', environmentId: 'e', relayPublicUrl: 'wss://daemon.example.com' },
-    });
-    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/ANIMUS_ENV_RELAY_PORT/);
-  });
+  // NOTE: the public relay URL + port are now owned by the SINGLETON relay
+  // process (animus-env-relay), not this plugin — the two former tests that
+  // asserted this plugin binds/validates the port were removed with that move.
+  // The singleton's own port validation lives in relay-cli (env-transport).
 });
 
 // ---------------------------------------------------------------------------
