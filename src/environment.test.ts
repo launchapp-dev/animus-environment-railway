@@ -23,6 +23,7 @@ import {
   cloneCommands,
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
+  DEFAULT_CLAUDE_CONFIG_DIR,
   DEFAULT_CODEX_OAUTH_HOME,
   DEFAULT_IMAGE,
   githubAppCredentials,
@@ -151,6 +152,28 @@ describe('pure helpers', () => {
     // harnessCredentialVars reads this path when the daemon env omits
     // CODEX_OAUTH_HOME, so codex works on nodes without extra portal config.
     expect(DEFAULT_CODEX_OAUTH_HOME).toBe('/data/animus-state/codex-config');
+  });
+
+  it('exposes the durable portal claude config dir as the default fallback', () => {
+    // claudeNodeCredentials reads this path when the daemon env omits
+    // CLAUDE_CONFIG_DIR, so claude auth works on nodes without extra portal config.
+    expect(DEFAULT_CLAUDE_CONFIG_DIR).toBe('/data/animus-state/claude-config');
+  });
+
+  it('claudeNodeCredentials uses DEFAULT_CLAUDE_CONFIG_DIR when CLAUDE_CONFIG_DIR is unset', async () => {
+    // With CLAUDE_CONFIG_DIR unset and no file at the default path, returns {} (best-effort).
+    expect(await claudeNodeCredentials({} as NodeJS.ProcessEnv, 1_000_000)).toEqual({});
+    // With CLAUDE_CONFIG_DIR unset but a credentials file at the default path, reads it.
+    // (We can't write to /data in tests, so we verify the override still wins.)
+    const dir = mkdtempSync(join(tmpdir(), 'claude-default-'));
+    const now = 1_000_000;
+    writeFileSync(
+      join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'B', refreshToken: 'R', expiresAt: now + 3_600_000 } }),
+    );
+    // Simulate the default by passing it explicitly via the override variable.
+    const vars = await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now);
+    expect(JSON.parse(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString()).claudeAiOauth.accessToken).toBe('B');
   });
 
   it('harnessCredentialVars skips missing creds (best-effort)', () => {

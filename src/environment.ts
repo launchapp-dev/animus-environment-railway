@@ -265,6 +265,12 @@ const CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000;
  *  without any extra portal config. */
 export const DEFAULT_CODEX_OAUTH_HOME = '/data/animus-state/codex-config';
 
+/** Durable dir the portal Connections flow stores the Claude `.credentials.json`
+ *  in (the portal's claude wrapper + start.sh default). Used when the daemon env
+ *  leaves `CLAUDE_CONFIG_DIR` unset so the node still gets claude auth without
+ *  any extra portal config. */
+export const DEFAULT_CLAUDE_CONFIG_DIR = '/data/animus-state/claude-config';
+
 /** Read the daemon-side Codex auth.json + GitHub token and encode them for the
  *  node bootstrap. Claude is handled separately (async central refresh). */
 export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
@@ -300,8 +306,7 @@ export async function claudeNodeCredentials(
   now: number,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Record<string, string>> {
-  const dir = hostEnv.CLAUDE_CONFIG_DIR;
-  if (!dir) return {};
+  const dir = hostEnv.CLAUDE_CONFIG_DIR ?? DEFAULT_CLAUDE_CONFIG_DIR;
   const path = `${dir.replace(/\/$/, '')}/.credentials.json`;
   let file: Record<string, unknown>;
   let oauth: Record<string, unknown>;
