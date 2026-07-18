@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.10',
+  version: '0.4.11',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -145,7 +145,7 @@ const plugin = defineEnvironmentPlugin({
   execSession: async (params, emit) => {
     const result = await env.runSession(
       params.handle,
-      { subject_id: params.subject_id, workflow_ref: params.workflow_ref, dispatch_input: params.dispatch_input },
+      { subject_id: params.subject_id, workflow_ref: params.workflow_ref, dispatch_input: params.dispatch_input, workflow_id: params.workflow_id },
       (ev) =>
         emit({
           kind: 'journal',
