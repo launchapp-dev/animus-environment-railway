@@ -145,7 +145,12 @@ const plugin = defineEnvironmentPlugin({
   execSession: async (params, emit) => {
     const result = await env.runSession(
       params.handle,
-      { subject_id: params.subject_id, workflow_ref: params.workflow_ref, dispatch_input: params.dispatch_input },
+      {
+        subject_id: params.subject_id,
+        workflow_ref: params.workflow_ref,
+        dispatch_input: params.dispatch_input,
+        workflow_id: params.workflow_id,
+      },
       (ev) =>
         emit({
           kind: 'journal',

@@ -766,7 +766,12 @@ export class RailwayEnvironment {
    *  remote-animus) and stream its journal events back via `onJournal`. */
   async runSession(
     handle: EnvironmentHandle,
-    params: { subject_id: string; workflow_ref?: string | null; dispatch_input?: string | null },
+    params: {
+      subject_id: string;
+      workflow_ref?: string | null;
+      dispatch_input?: string | null;
+      workflow_id?: string | null;
+    },
     onJournal?: (event: JournalEventParams) => void,
   ): Promise<SessionResult> {
     const relay = await this.relay();
