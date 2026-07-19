@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.11',
+  version: '0.4.12',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -170,6 +170,22 @@ const plugin = defineEnvironmentPlugin({
   teardown: async (params) => {
     await env.teardown(params.handle);
     return {};
+  },
+
+  listNodes: async () => ({ nodes: await env.listNodes() }),
+
+  getNode: async (params) => ({ node: await env.getNode(params.id) }),
+
+  teardownNode: async (params) => ({ deleted: await env.teardownNode(params.id) }),
+
+  reapNodes: async (params) => {
+    const r = await env.reap({
+      all: params.all,
+      force: params.force,
+      dryRun: params.dry_run,
+      olderThanSecs: params.older_than_secs,
+    });
+    return { deleted: r.deleted, kept: r.kept, dry_run: r.dryRun };
   },
 
   // Surface missing Railway credentials/config at preflight instead of on the

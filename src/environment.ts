@@ -18,6 +18,7 @@ import {
   planWorkspace,
   provisionAnimus,
   type EnvironmentHandle,
+  type EnvironmentNodeDescriptor,
   type ExecResponse,
   type HarnessCommand,
   type HealthReport,
@@ -44,7 +45,7 @@ type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | '
   waitForConnection(handleId: string, timeoutMs: number): Promise<unknown>;
 };
 
-import { RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+import { DEAD_DEPLOYMENT_STATES, RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
 
 // Short, Railway-valid id token: `<prefix><6 hex>`. The service name is
 // `animus-run-<instanceId>-<id>`, and Railway rejects long service names
@@ -833,6 +834,101 @@ export class RailwayEnvironment {
       removed.push(svc.id);
     }
     return removed;
+  }
+
+  /** Node-management (`environment/list`): describe every `animus-run-*` service
+   *  in the project with its latest-deployment state. `orphan` is state-based
+   *  (a dead deployment is always a reap candidate). */
+  async listNodes(): Promise<EnvironmentNodeDescriptor[]> {
+    const projectId = this.config.projectId;
+    if (!projectId) throw new Error('list needs a project id (RAILWAY_PROJECT_ID)');
+    return this.describeNodes(projectId);
+  }
+
+  /** Node-management (`environment/get`): one node by service id or name. */
+  async getNode(idOrName: string): Promise<EnvironmentNodeDescriptor | null> {
+    const nodes = await this.listNodes();
+    return nodes.find((n) => n.id === idOrName || n.name === idOrName) ?? null;
+  }
+
+  /** Node-management (`environment/teardown_node`): delete one service by id or
+   *  name. Idempotent — an unknown/already-gone node returns `[]`. */
+  async teardownNode(idOrName: string): Promise<string[]> {
+    const projectId = this.config.projectId;
+    const environmentId = this.config.environmentId;
+    if (!projectId) throw new Error('teardown needs a project id (RAILWAY_PROJECT_ID)');
+    if (!environmentId) throw new Error('teardown needs an environment id (RAILWAY_ENVIRONMENT_ID)');
+    const match = (await this.railway().listRunServices(projectId)).find(
+      (s) => s.id === idOrName || s.name === idOrName,
+    );
+    if (!match) return [];
+    await this.railway().deleteService(match.id, environmentId);
+    return [match.id];
+  }
+
+  /** Node-management (`environment/reap`): delete orphaned/dead nodes.
+   *
+   *  Default (no opts): reap ONLY services whose latest deployment is dead
+   *  (FAILED/CRASHED/REMOVED) — always safe, since a healthy live node is never
+   *  in a dead state. `all` additionally reaps non-dead services that have no
+   *  live owning run, but ONLY with `force` (a fresh, non-resident process has
+   *  no in-memory liveness, so it must not assume every healthy node is an
+   *  orphan). `dry_run` reports the plan without deleting. */
+  async reap(
+    opts: { all?: boolean; force?: boolean; dryRun?: boolean; olderThanSecs?: number } = {},
+  ): Promise<{ deleted: string[]; kept: EnvironmentNodeDescriptor[]; dryRun: boolean }> {
+    const projectId = this.config.projectId;
+    const environmentId = this.config.environmentId;
+    if (!projectId) throw new Error('reap needs a project id (RAILWAY_PROJECT_ID)');
+    if (!environmentId) throw new Error('reap needs an environment id (RAILWAY_ENVIRONMENT_ID)');
+    const nodes = await this.describeNodes(projectId);
+    const liveNames = new Set(
+      (this.relayInstance?.registeredRuns() ?? []).map((h) => `${this.instancePrefix()}${h}`),
+    );
+    const now = Date.now();
+    const deleted: string[] = [];
+    const kept: EnvironmentNodeDescriptor[] = [];
+    for (const node of nodes) {
+      const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
+      const live = liveNames.has(node.name);
+      const oldEnough =
+        opts.olderThanSecs === undefined ||
+        (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= opts.olderThanSecs : true);
+      let reapIt = false;
+      if (dead && oldEnough) reapIt = true;
+      else if (opts.all && opts.force && !live && oldEnough) reapIt = true;
+      if (!reapIt) {
+        kept.push(node);
+        continue;
+      }
+      if (!opts.dryRun) await this.railway().deleteService(node.id, environmentId);
+      deleted.push(node.id);
+    }
+    return { deleted, kept, dryRun: opts.dryRun === true };
+  }
+
+  /** Shared listing used by list/get/reap: prefer the state-aware query, fall
+   *  back to id+name only when the substrate can't report deployment state. */
+  private async describeNodes(projectId: string): Promise<EnvironmentNodeDescriptor[]> {
+    const api = this.railway();
+    let rows: Array<{ id: string; name: string; status?: string | null; createdAt?: string | null }>;
+    if (typeof api.listRunServicesDetailed === 'function') {
+      rows = await api.listRunServicesDetailed(projectId);
+    } else {
+      rows = await api.listRunServices(projectId);
+    }
+    return rows.map((r) => {
+      const state = (r.status ?? 'unknown').toString();
+      return {
+        id: r.id,
+        name: r.name,
+        state,
+        run_id: null,
+        image: null,
+        created_at: r.createdAt ?? null,
+        orphan: DEAD_DEPLOYMENT_STATES.has(state.toUpperCase()),
+      };
+    });
   }
 
   /** Health: surface missing credentials/config before scheduling work. The

@@ -34,7 +34,13 @@ import {
   runVariables,
   WORKSPACE_ROOT,
 } from './environment.js';
-import { SERVICE_NAME_PREFIX, type CreatedService, type RailwayApi, type ServiceCreateInput } from './railway.js';
+import {
+  SERVICE_NAME_PREFIX,
+  type CreatedService,
+  type RailwayApi,
+  type RunServiceDetail,
+  type ServiceCreateInput,
+} from './railway.js';
 
 const NODE = process.execPath;
 
@@ -74,6 +80,12 @@ class FakeRailway implements RailwayApi {
 
   async listRunServices(): Promise<Array<{ id: string; name: string }>> {
     return this.listed;
+  }
+
+  /** Set to drive the state-aware node-management surface (list/get/reap). */
+  detailed: RunServiceDetail[] | null = null;
+  async listRunServicesDetailed(): Promise<RunServiceDetail[]> {
+    return this.detailed ?? this.listed.map((s) => ({ ...s, status: null, createdAt: null }));
   }
 
   closeBridges(): void {
@@ -585,6 +597,65 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const removed = await env.gcOrphans({ allInstances: true });
     expect(removed).toEqual(['svc-crashed-instance']);
     expect(fake.deleted.map((d) => d.serviceId)).not.toContain('svc-live');
+  });
+
+  it('list reports nodes with state + a state-based orphan flag', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [
+      { id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null },
+      { id: 'svc-dead', name: `${SERVICE_NAME_PREFIX}bbb`, status: 'FAILED', createdAt: null },
+    ];
+    const nodes = await env.listNodes();
+    expect(nodes.map((n) => [n.id, n.state, n.orphan])).toEqual([
+      ['svc-ok', 'SUCCESS', false],
+      ['svc-dead', 'FAILED', true],
+    ]);
+  });
+
+  it('get returns one node by id or name, else null', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [{ id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null }];
+    expect((await env.getNode('svc-ok'))?.id).toBe('svc-ok');
+    expect((await env.getNode(`${SERVICE_NAME_PREFIX}aaa`))?.id).toBe('svc-ok');
+    expect(await env.getNode('nope')).toBeNull();
+  });
+
+  it('teardownNode deletes by id or name and is idempotent', async () => {
+    const { env, fake } = await makeEnv();
+    fake.listed = [{ id: 'svc-1', name: `${SERVICE_NAME_PREFIX}aaa` }];
+    expect(await env.teardownNode('svc-1')).toEqual(['svc-1']);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
+    expect(await env.teardownNode('unknown-id')).toEqual([]); // no match -> no-op
+    expect(await env.teardownNode(`${SERVICE_NAME_PREFIX}aaa`)).toEqual(['svc-1']); // by name too
+  });
+
+  it('reap (default) deletes ONLY dead-state nodes, sparing healthy ones', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [
+      { id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null },
+      { id: 'svc-fail', name: `${SERVICE_NAME_PREFIX}bbb`, status: 'FAILED', createdAt: null },
+      { id: 'svc-crash', name: `${SERVICE_NAME_PREFIX}ccc`, status: 'CRASHED', createdAt: null },
+    ];
+    const res = await env.reap();
+    expect(res.deleted.sort()).toEqual(['svc-crash', 'svc-fail']);
+    expect(res.kept.map((n) => n.id)).toEqual(['svc-ok']);
+    expect(fake.deleted.map((d) => d.serviceId).sort()).toEqual(['svc-crash', 'svc-fail']);
+  });
+
+  it('reap dry_run reports the plan without deleting anything', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [{ id: 'svc-fail', name: `${SERVICE_NAME_PREFIX}bbb`, status: 'FAILED', createdAt: null }];
+    const res = await env.reap({ dryRun: true });
+    expect(res.deleted).toEqual(['svc-fail']);
+    expect(res.dryRun).toBe(true);
+    expect(fake.deleted).toEqual([]);
+  });
+
+  it('reap spares healthy orphans unless all+force (the empty-liveness guard)', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [{ id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null }];
+    expect((await env.reap({ all: true })).deleted).toEqual([]); // all without force: still spared
+    expect((await env.reap({ all: true, force: true })).deleted).toEqual(['svc-ok']); // now reaped
   });
 
   it('health degrades (not fails) on missing per-run-suppliable config', async () => {
