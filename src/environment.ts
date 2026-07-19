@@ -87,6 +87,10 @@ export const WORKSPACE_ROOT = '/workspace';
  *  image does not ship it yet — see INTEGRATION.md. */
 export const DEFAULT_BRIDGE_COMMAND = 'animus-env-bridge';
 
+/** Bound on the pre-teardown cleanup hook (e.g. git commit+push) so a slow or
+ *  hung cleanup can never block node teardown (TASK-809). */
+export const CLEANUP_TIMEOUT_SECS = 120;
+
 /** Default parent-side log-storage plugin a node's `log_storage/*` backend/call
  *  is serviced against (its install path in the portal image). */
 export const DEFAULT_UPSTREAM_LOG_BIN = '/app/.animus/plugins/animus-log-storage-s3';
@@ -129,6 +133,11 @@ export interface RailwayHandleMeta {
    *  cold-delete by deterministic name when a caller only has the run id (e.g.
    *  the daemon persisted the run id but crashed before recording service_id). */
   animus_run_id?: string | null;
+  /** Workflow-declared cleanup script (TASK-809): a `sh -c` command run IN the
+   *  node right before it is destroyed, to flush uncommitted work to its branch
+   *  (e.g. `git add -A && git commit -m checkpoint && git push`). Sourced from
+   *  `spec.metadata.cleanup`; absent for workflows that declare no cleanup. */
+  cleanup?: string | null;
 }
 
 export interface RailwayEnvironmentConfig {
@@ -726,6 +735,9 @@ export class RailwayEnvironment {
       throw err;
     }
 
+    const specMeta = (spec.metadata ?? {}) as Record<string, unknown>;
+    const cleanup =
+      typeof specMeta.cleanup === 'string' && specMeta.cleanup.trim().length > 0 ? specMeta.cleanup.trim() : null;
     const metadata: RailwayHandleMeta = {
       service_id: serviceId,
       service_name: serviceName,
@@ -735,6 +747,7 @@ export class RailwayEnvironment {
       image,
       primary_subdir: plan.primarySubdir,
       animus_run_id: runId,
+      cleanup,
     };
     return { handle: { id, workspace_root: WORKSPACE_ROOT, metadata } };
   }
@@ -782,8 +795,22 @@ export class RailwayEnvironment {
   /** `teardown`: delete the Railway service and release the relay run.
    *  Idempotent — a missing service or unknown handle is a successful no-op. */
   async teardown(handle: EnvironmentHandle): Promise<void> {
-    if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
     const meta = handle.metadata as RailwayHandleMeta | undefined;
+    // Pre-teardown cleanup hook (TASK-809): run a workflow-declared command IN the
+    // node (e.g. `git add -A && git commit && git push`) to flush uncommitted work
+    // to its branch BEFORE the node is destroyed. Best-effort + bounded, attempted
+    // only while this instance's relay is still connected (graceful teardown); a
+    // failed/slow cleanup never blocks teardown, and a crashed node is covered by
+    // incremental pushes during the run.
+    const cleanup = meta?.cleanup?.trim();
+    if (cleanup && this.relayInstance) {
+      try {
+        await this.execCommand(handle, { program: 'sh', args: ['-c', cleanup] }, null, CLEANUP_TIMEOUT_SECS);
+      } catch {
+        // best-effort: a failed cleanup must not block node teardown
+      }
+    }
+    if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
     const environmentId = meta?.environment_id || this.config.environmentId;
     // Fast path: a full handle carries the service_id; delete it directly.
     if (meta?.service_id) {

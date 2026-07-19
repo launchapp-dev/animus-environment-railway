@@ -548,6 +548,35 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.deleted).toEqual([{ serviceId: 'svc-match', environmentId: 'env-1' }]);
   });
 
+  it('teardown runs the workflow cleanup hook IN the node before deleting the service', async () => {
+    const { env, fake } = await makeEnv();
+    const dir = mkdtempSync(join(tmpdir(), 'cleanup-'));
+    const marker = join(dir, 'ran.marker');
+    const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { cleanup: `echo done > ${marker}` } } });
+    // The workflow-declared cleanup is stored on the handle.
+    expect((handle.metadata as Record<string, unknown>).cleanup).toBe(`echo done > ${marker}`);
+    await env.teardown(handle);
+    // The fake bridge executed the cleanup in the node (flushing work) BEFORE the
+    // service was deleted — proving push-before-teardown is possible.
+    expect(readFileSync(marker, 'utf8').trim()).toBe('done');
+    expect(fake.deleted.map((d) => d.serviceId)).toContain('svc-1');
+  });
+
+  it('teardown with no cleanup hook declared deletes the service as before', async () => {
+    const { env, fake } = await makeEnv();
+    const { handle } = await env.prepare({ spec: { kind: 'railway' } });
+    expect((handle.metadata as Record<string, unknown>).cleanup).toBeNull();
+    await env.teardown(handle);
+    expect(fake.deleted.length).toBeGreaterThan(0);
+  });
+
+  it('a failing cleanup hook never blocks teardown (best-effort)', async () => {
+    const { env, fake } = await makeEnv();
+    const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { cleanup: 'exit 3' } } });
+    await expect(env.teardown(handle)).resolves.toBeUndefined();
+    expect(fake.deleted.map((d) => d.serviceId)).toContain('svc-1');
+  });
+
   it('rolls back (delete + release) when the container never dials home', async () => {
     const { env, fake } = await makeEnv();
     fake.bootBridge = false;
