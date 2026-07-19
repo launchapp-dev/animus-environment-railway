@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.13',
+  version: '0.4.14',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -95,6 +95,12 @@ const plugin = defineEnvironmentPlugin({
     {
       name: 'ANIMUS_ENV_DIAL_TIMEOUT_SECS',
       description: 'How long prepare waits for the container to dial home (default 300).',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_CLEANUP',
+      description:
+        'Default cleanup script (sh -c) run IN every node right before teardown, to flush uncommitted work to its branch (e.g. `git add -A && git commit -m checkpoint && git push origin HEAD || true`). Best-effort + bounded; a per-run spec.metadata.cleanup overrides it.',
       required: false,
     },
     {

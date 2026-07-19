@@ -180,6 +180,11 @@ export interface RailwayEnvironmentConfig {
   upstreamLogBin?: string;
   /** Extra TLS material for an in-process WSS listener. */
   tls?: RelayServerOptions['tls'];
+  /** Default cleanup script (TASK-809): a `sh -c` command run IN every node
+   *  right before teardown, to flush uncommitted work (e.g.
+   *  `git add -A && git commit && git push`). Sourced from `ANIMUS_ENV_CLEANUP`;
+   *  a per-run `spec.metadata.cleanup` overrides it. */
+  cleanup?: string;
 }
 
 /** Read the config from the process env (the plugin's runtime posture). */
@@ -187,6 +192,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
   return {
     projectId: env.RAILWAY_PROJECT_ID,
     environmentId: env.RAILWAY_ENVIRONMENT_ID,
+    cleanup: env.ANIMUS_ENV_CLEANUP,
     relayPublicUrl: env.ANIMUS_ENV_RELAY_PUBLIC_URL,
     relayPort: env.ANIMUS_ENV_RELAY_PORT ? Number(env.ANIMUS_ENV_RELAY_PORT) : undefined,
     bridgeCommand: env.ANIMUS_ENV_BRIDGE_COMMAND,
@@ -736,8 +742,14 @@ export class RailwayEnvironment {
     }
 
     const specMeta = (spec.metadata ?? {}) as Record<string, unknown>;
+    // Per-run `spec.metadata.cleanup` overrides the global `ANIMUS_ENV_CLEANUP`
+    // default; either yields a `sh -c` script run in-node just before teardown.
     const cleanup =
-      typeof specMeta.cleanup === 'string' && specMeta.cleanup.trim().length > 0 ? specMeta.cleanup.trim() : null;
+      typeof specMeta.cleanup === 'string' && specMeta.cleanup.trim().length > 0
+        ? specMeta.cleanup.trim()
+        : this.config.cleanup && this.config.cleanup.trim().length > 0
+          ? this.config.cleanup.trim()
+          : null;
     const metadata: RailwayHandleMeta = {
       service_id: serviceId,
       service_name: serviceName,
@@ -802,7 +814,7 @@ export class RailwayEnvironment {
     // only while this instance's relay is still connected (graceful teardown); a
     // failed/slow cleanup never blocks teardown, and a crashed node is covered by
     // incremental pushes during the run.
-    const cleanup = meta?.cleanup?.trim();
+    const cleanup = meta?.cleanup?.trim() || this.config.cleanup?.trim();
     if (cleanup && this.relayInstance) {
       try {
         await this.execCommand(handle, { program: 'sh', args: ['-c', cleanup] }, null, CLEANUP_TIMEOUT_SECS);

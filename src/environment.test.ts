@@ -9,7 +9,7 @@
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
 import { createHash, generateKeyPairSync } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -575,6 +575,47 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { cleanup: 'exit 3' } } });
     await expect(env.teardown(handle)).resolves.toBeUndefined();
     expect(fake.deleted.map((d) => d.serviceId)).toContain('svc-1');
+  });
+
+  it('teardown falls back to the global ANIMUS_ENV_CLEANUP default when no per-run cleanup is set', async () => {
+    const fake = new FakeRailway();
+    const relay = await RelayServer.listen({ host: '127.0.0.1', port: 0 });
+    const dir = mkdtempSync(join(tmpdir(), 'cleanup-cfg-'));
+    const marker = join(dir, 'ran.marker');
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: { projectId: 'proj-1', environmentId: 'env-1', dialTimeoutSecs: 10, cleanup: `echo global > ${marker}` },
+    });
+    live.push({ env, fake });
+    const { handle } = await env.prepare({ spec: { kind: 'railway' } });
+    await env.teardown(handle);
+    expect(readFileSync(marker, 'utf8').trim()).toBe('global');
+  });
+
+  it('a per-run spec.metadata.cleanup overrides the global default', async () => {
+    const fake = new FakeRailway();
+    const relay = await RelayServer.listen({ host: '127.0.0.1', port: 0 });
+    const dir = mkdtempSync(join(tmpdir(), 'cleanup-ovr-'));
+    const globalMarker = join(dir, 'global.marker');
+    const runMarker = join(dir, 'run.marker');
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        dialTimeoutSecs: 10,
+        cleanup: `echo global > ${globalMarker}`,
+      },
+    });
+    live.push({ env, fake });
+    const { handle } = await env.prepare({
+      spec: { kind: 'railway', metadata: { cleanup: `echo perrun > ${runMarker}` } },
+    });
+    await env.teardown(handle);
+    expect(readFileSync(runMarker, 'utf8').trim()).toBe('perrun');
+    expect(existsSync(globalMarker)).toBe(false);
   });
 
   it('rolls back (delete + release) when the container never dials home', async () => {
