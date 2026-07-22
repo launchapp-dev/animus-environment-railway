@@ -46,6 +46,7 @@ type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | '
 };
 
 import { DEAD_DEPLOYMENT_STATES, RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+import { makeCredentialsServicer } from './credentials-servicer.js';
 
 // Short, Railway-valid id token: `<prefix><6 hex>`. The service name is
 // `animus-run-<instanceId>-<id>`, and Railway rejects long service names
@@ -399,8 +400,9 @@ export function parseGithubSlug(url: string | undefined): { owner: string; repo:
   return m && m[1] && m[2] ? { owner: m[1], repo: m[2] } : null;
 }
 
-/** Sign a short-lived (<=10 min) GitHub App JWT (RS256) with the app private key. */
-function githubAppJwt(appId: string, privateKeyPem: string, now: number): string {
+/** Sign a short-lived (<=10 min) GitHub App JWT (RS256) with the app private key.
+ *  Exported for the credentials servicer (on-demand re-minting for nodes). */
+export function githubAppJwt(appId: string, privateKeyPem: string, now: number): string {
   const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
   const data = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iat: now - 60, exp: now + 540, iss: appId })}`;
   const sig = createSign('RSA-SHA256').update(data).sign(privateKeyPem, 'base64url');
@@ -617,13 +619,20 @@ export class RailwayEnvironment {
       // passthrough): log_storage/* → the parent's log-storage-s3 (same bucket as
       // the daemon), everything else → animus-postgres. Omitted → reverse RPC
       // stays unwired and nodes fall back to their own local backends.
+      // The `credentials` role serves on-demand GitHub token re-mints for the
+      // node's git credential helper (TASK-855) — installation-wide scope, App
+      // private key never crosses the relay. Wired alongside the backend
+      // passthrough only (an unwired reverse RPC keeps its existing semantics:
+      // nodes fall back to their own local backends).
       this.relayInstance = await RelayClient.connect({
         socketPath: this.config.relaySocketPath,
         ...(backend
           ? {
-              onReverseRpc: makeBackendCallHandler(
-                logBackend ? { default: backend, log_storage: logBackend } : backend,
-              ),
+              onReverseRpc: makeBackendCallHandler({
+                default: backend,
+                ...(logBackend ? { log_storage: logBackend } : {}),
+                credentials: makeCredentialsServicer(process.env),
+              }),
             }
           : {}),
       });
