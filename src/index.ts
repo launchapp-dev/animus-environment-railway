@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.15',
+  version: '0.4.16',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -190,6 +190,7 @@ const plugin = defineEnvironmentPlugin({
       force: params.force,
       dryRun: params.dry_run,
       olderThanSecs: params.older_than_secs,
+      liveRunIds: params.live_run_ids,
     });
     return { deleted: r.deleted, kept: r.kept, dry_run: r.dryRun };
   },

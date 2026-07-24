@@ -92,6 +92,12 @@ export const DEFAULT_BRIDGE_COMMAND = 'animus-env-bridge';
  *  hung cleanup can never block node teardown (TASK-809). */
 export const CLEANUP_TIMEOUT_SECS = 120;
 
+/** Owner-known reap grace floor: a node younger than this may be mid-`prepare`
+ *  (the service exists before the daemon has leased/recorded the run), so it is
+ *  never a reap candidate even when it maps to no live run id. Matches the dial
+ *  timeout default. */
+export const REAP_LEAKED_GRACE_SECS = 300;
+
 /** Default parent-side log-storage plugin a node's `log_storage/*` backend/call
  *  is serviced against (its install path in the portal image). */
 export const DEFAULT_UPSTREAM_LOG_BIN = '/app/.animus/plugins/animus-log-storage-s3';
@@ -906,8 +912,13 @@ export class RailwayEnvironment {
     const environmentId = this.config.environmentId;
     if (!projectId) throw new Error('teardown needs a project id (RAILWAY_PROJECT_ID)');
     if (!environmentId) throw new Error('teardown needs an environment id (RAILWAY_ENVIRONMENT_ID)');
+    // Restart-recoverable teardown: accept a substrate service id, a literal
+    // service name, OR a bare animus run id — resolving the run id to its
+    // deterministic service name so a daemon that persisted only the run id can
+    // drive teardown after losing the in-memory handle (TASK-797/TASK-933).
+    const byRunName = deterministicServiceName(projectId, idOrName);
     const match = (await this.railway().listRunServices(projectId)).find(
-      (s) => s.id === idOrName || s.name === idOrName,
+      (s) => s.id === idOrName || s.name === idOrName || s.name === byRunName,
     );
     if (!match) return [];
     await this.railway().deleteService(match.id, environmentId);
@@ -921,18 +932,42 @@ export class RailwayEnvironment {
    *  in a dead state. `all` additionally reaps non-dead services that have no
    *  live owning run, but ONLY with `force` (a fresh, non-resident process has
    *  no in-memory liveness, so it must not assume every healthy node is an
-   *  orphan). `dry_run` reports the plan without deleting. */
+   *  orphan). `dry_run` reports the plan without deleting.
+   *
+   *  Owner-known mode: when `liveRunIds` (the daemon's authoritative set of live
+   *  run ids) is supplied, a healthy node whose name maps to NO live run id is a
+   *  leak and is reaped WITHOUT `force` — with a mandatory {@link
+   *  REAP_LEAKED_GRACE_SECS} floor so an in-flight `prepare` is never reaped. */
   async reap(
-    opts: { all?: boolean; force?: boolean; dryRun?: boolean; olderThanSecs?: number } = {},
+    opts: {
+      all?: boolean;
+      force?: boolean;
+      dryRun?: boolean;
+      olderThanSecs?: number;
+      /** Daemon's authoritative live-run set. Present => owner-known mode:
+       *  healthy nodes mapping to no live run id are reaped WITHOUT `force`. */
+      liveRunIds?: string[];
+    } = {},
   ): Promise<{ deleted: string[]; kept: EnvironmentNodeDescriptor[]; dryRun: boolean }> {
     const projectId = this.config.projectId;
     const environmentId = this.config.environmentId;
     if (!projectId) throw new Error('reap needs a project id (RAILWAY_PROJECT_ID)');
     if (!environmentId) throw new Error('reap needs an environment id (RAILWAY_ENVIRONMENT_ID)');
     const nodes = await this.describeNodes(projectId);
+    // Protected set = names of runs KNOWN to be live. Two authoritative sources,
+    // unioned: (1) this process's in-memory relay registrations (only meaningful
+    // in the resident daemon), and (2) the daemon-supplied live run ids mapped to
+    // their deterministic service names (works from a fresh CLI process too).
     const liveNames = new Set(
       (this.relayInstance?.registeredRuns() ?? []).map((h) => `${this.instancePrefix()}${h}`),
     );
+    const ownerKnown = opts.liveRunIds !== undefined;
+    for (const rid of opts.liveRunIds ?? []) liveNames.add(deterministicServiceName(projectId, rid));
+    // In owner-known mode enforce a grace floor so a mid-prepare node (created
+    // before the daemon leased its run) is never reaped out from under itself.
+    const graceSecs = ownerKnown
+      ? Math.max(opts.olderThanSecs ?? 0, REAP_LEAKED_GRACE_SECS)
+      : opts.olderThanSecs;
     const now = Date.now();
     const deleted: string[] = [];
     const kept: EnvironmentNodeDescriptor[] = [];
@@ -940,11 +975,14 @@ export class RailwayEnvironment {
       const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
       const live = liveNames.has(node.name);
       const oldEnough =
-        opts.olderThanSecs === undefined ||
-        (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= opts.olderThanSecs : true);
+        graceSecs === undefined ||
+        (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= graceSecs : true);
       let reapIt = false;
       if (dead && oldEnough) reapIt = true;
-      else if (opts.all && opts.force && !live && oldEnough) reapIt = true;
+      // Owner-known: a healthy node mapping to no live run id is a leak — reap it
+      // WITHOUT `force` (the daemon's live set is authoritative). Legacy path
+      // (no live set supplied) keeps the `all`+`force` empty-liveness guard.
+      else if (!live && oldEnough && (ownerKnown || (opts.all && opts.force))) reapIt = true;
       if (!reapIt) {
         kept.push(node);
         continue;

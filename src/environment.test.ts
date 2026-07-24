@@ -728,6 +728,51 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect((await env.reap({ all: true, force: true })).deleted).toEqual(['svc-ok']); // now reaped
   });
 
+  it('teardownNode resolves a bare run id to its deterministic service name', async () => {
+    const { env, fake } = await makeEnv();
+    const runId = 'run-teardown-1';
+    const name = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', runId])).digest('hex').slice(0, 12);
+    fake.listed = [
+      { id: 'svc-run', name },
+      { id: 'svc-other', name: `${SERVICE_NAME_PREFIX}unrelated` },
+    ];
+    // A restarted daemon that persisted only the run id can drive teardown by it.
+    expect(await env.teardownNode(runId)).toEqual(['svc-run']);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-run', environmentId: 'env-1' }]);
+    expect(await env.teardownNode('run-not-live')).toEqual([]); // unknown run id -> no-op
+  });
+
+  it('reap owner-known keeps the live node but reaps a non-live healthy node WITHOUT force', async () => {
+    const { env, fake } = await makeEnv();
+    const liveRun = 'run-live';
+    const deadRun = 'run-orphaned';
+    const liveName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', liveRun])).digest('hex').slice(0, 12);
+    const orphanName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', deadRun])).digest('hex').slice(0, 12);
+    const old = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // older than the 300s grace
+    fake.detailed = [
+      { id: 'svc-live', name: liveName, status: 'SUCCESS', createdAt: old },
+      { id: 'svc-orphan', name: orphanName, status: 'SUCCESS', createdAt: old },
+    ];
+    const res = await env.reap({ liveRunIds: [liveRun] }); // no force
+    expect(res.deleted).toEqual(['svc-orphan']);
+    expect(res.kept.map((n) => n.id)).toEqual(['svc-live']);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-orphan', environmentId: 'env-1' }]);
+  });
+
+  it('reap owner-known enforces the grace floor: a mid-prepare (young) node is spared', async () => {
+    const { env, fake } = await makeEnv();
+    const young = new Date(Date.now() - 5 * 1000).toISOString(); // 5s old — under the 300s grace
+    fake.detailed = [
+      { id: 'svc-young', name: `${SERVICE_NAME_PREFIX}young`, status: 'SUCCESS', createdAt: young },
+    ];
+    // Empty live set => every healthy node is unowned, but the grace floor still
+    // protects a node that may be mid-`prepare` (created before it was leased).
+    const res = await env.reap({ liveRunIds: [] });
+    expect(res.deleted).toEqual([]);
+    expect(res.kept.map((n) => n.id)).toEqual(['svc-young']);
+    expect(fake.deleted).toEqual([]);
+  });
+
   it('health degrades (not fails) on missing per-run-suppliable config', async () => {
     const fake = new FakeRailway();
     const env = new RailwayEnvironment({ railway: fake, config: {} });
