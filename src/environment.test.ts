@@ -160,20 +160,17 @@ describe('pure helpers', () => {
     expect(DEFAULT_CLAUDE_CONFIG_DIR).toBe('/data/animus-state/claude-config');
   });
 
-  it('claudeNodeCredentials uses DEFAULT_CLAUDE_CONFIG_DIR when CLAUDE_CONFIG_DIR is unset', async () => {
-    // With CLAUDE_CONFIG_DIR unset and no file at the default path, returns {} (best-effort).
-    expect(await claudeNodeCredentials({} as NodeJS.ProcessEnv, 1_000_000)).toEqual({});
-    // With CLAUDE_CONFIG_DIR unset but a credentials file at the default path, reads it.
-    // (We can't write to /data in tests, so we verify the override still wins.)
+  it('claudeNodeCredentials reads from CLAUDE_CONFIG_DIR when set, returns {} when absent', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'claude-default-'));
     const now = 1_000_000;
     writeFileSync(
       join(dir, '.credentials.json'),
       JSON.stringify({ claudeAiOauth: { accessToken: 'B', refreshToken: 'R', expiresAt: now + 3_600_000 } }),
     );
-    // Simulate the default by passing it explicitly via the override variable.
-    const vars = await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now);
+    const vars = await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now, fetch);
     expect(JSON.parse(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString()).claudeAiOauth.accessToken).toBe('B');
+    // With CLAUDE_CONFIG_DIR unset and no file at the default path, returns {} (best-effort).
+    expect(await claudeNodeCredentials({} as NodeJS.ProcessEnv, 1_000_000)).toEqual({});
   });
 
   it('harnessCredentialVars skips missing creds (best-effort)', () => {
