@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.17',
+  version: '0.4.18',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -36,6 +36,13 @@ const plugin = defineEnvironmentPlugin({
       description:
         'Railway environment within the project (spec.metadata.railway_environment_id overrides per-run).',
       required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_ACTOR_BINDING_SECRET',
+      description:
+        'Stable HMAC secret for restart-safe actor-bound handle metadata. Defaults to RAILWAY_TOKEN when unset.',
+      required: false,
+      sensitive: true,
     },
     {
       name: 'ANIMUS_ENV_RELAY_PUBLIC_URL',
@@ -159,7 +166,13 @@ const plugin = defineEnvironmentPlugin({
     },
   ],
 
-  prepare: (params) => env.prepare(params),
+  prepare: (params, ctx) =>
+    env.prepare(
+      params,
+      ctx.actor,
+      (params as Record<string, unknown>).actor,
+      Object.prototype.hasOwnProperty.call(params, 'actor'),
+    ),
 
   exec: (params) => env.execCommand(params.handle, params.command, params.stdin, params.timeout_secs),
 
@@ -168,7 +181,7 @@ const plugin = defineEnvironmentPlugin({
       emit({ kind: 'output', handle_id: params.handle.id, stream, text });
     }),
 
-  execSession: async (params, emit) => {
+  execSession: async (params, emit, ctx) => {
     const result = await env.runSession(
       params.handle,
       {
@@ -189,6 +202,9 @@ const plugin = defineEnvironmentPlugin({
           payload: ev.payload,
           terminal: ev.terminal ?? false,
         }),
+      ctx.actor,
+      (params as Record<string, unknown>).actor,
+      Object.prototype.hasOwnProperty.call(params, 'actor'),
     );
     return { workflow_id: result.workflow_id, status: result.status };
   },

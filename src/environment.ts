@@ -11,7 +11,7 @@
 // and the in-container bridge spawns them with `shell: false`. The provision
 // (git clone / animus install) commands assembled here are argv arrays too.
 
-import { createHash, createSign, randomBytes } from 'node:crypto';
+import { createHash, createHmac, createSign, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import {
@@ -22,15 +22,18 @@ import {
   type ExecResponse,
   type HarnessCommand,
   type HealthReport,
+  type CallContext,
   type PrepareRequest,
   type WorkspacePlan,
 } from '@launchapp-dev/animus-environment-base';
 import {
-  RelayServer,
   RelayClient,
   PluginClient,
   makeBackendCallHandler,
+  RelayErrorCode,
+  RelayRpcError,
   type RelayServerOptions,
+  type ReverseRpcHandler,
   type SessionResult,
   type JournalEventParams,
 } from '@launchapp-dev/animus-env-transport';
@@ -39,7 +42,7 @@ import {
  *  in-process `RelayServer` (tests) and the `RelayClient` that talks to the
  *  shared singleton (production). `registerRun` may be sync or async — callers
  *  `await` it. */
-type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | 'registeredRuns' | 'close'> & {
+export type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | 'registeredRuns' | 'close'> & {
   registerRun(handleId?: string): { url: string; token: string } | Promise<{ url: string; token: string }>;
   // RelayServer returns the connection, RelayClient returns void — callers ignore it.
   waitForConnection(handleId: string, timeoutMs: number): Promise<unknown>;
@@ -48,13 +51,166 @@ type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | '
 import { DEAD_DEPLOYMENT_STATES, RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
 import { makeCredentialsServicer } from './credentials-servicer.js';
 
-// Short, Railway-valid id token: `<prefix><6 hex>`. The service name is
-// `animus-run-<instanceId>-<id>`, and Railway rejects long service names
-// (~32-char limit), so both the per-process instance id and the per-run id
-// must stay compact. 6 hex (2^24) is ample uniqueness for a project's
-// concurrent runs, and the GC sweep still matches by the shared prefix.
+// Short, Railway-valid service-name token. This is cosmetic substrate naming,
+// never an authorization identifier.
 function shortId(prefix: string): string {
   return `${prefix}${randomBytes(3).toString('hex')}`;
+}
+
+/** Relay/environment handle ids are bearer-adjacent routing identifiers. Give
+ * them 128 random bits so an attacker cannot feasibly guess a live handle. */
+function secureHandleId(): string {
+  return `r${randomBytes(16).toString('hex')}`;
+}
+
+/** Compact, deterministic service-name projection of a secure handle id. The
+ * full 128-bit id remains required by the relay; exposing this 40-bit prefix in
+ * Railway naming does not make the remaining 88 random bits guessable. */
+function handleServiceToken(handleId: string): string {
+  return handleId.slice(0, 11);
+}
+
+/** Trusted parent-to-node actor handoff consumed by the direct workflow runner.
+ * A workflow/environment spec can never set this variable: only the actor the
+ * plugin SDK extracted from the JSON-RPC call context may populate it. */
+export const ACTOR_ENV = 'ANIMUS_ACTOR_JSON';
+
+type Actor = NonNullable<CallContext['actor']>;
+
+export interface ActorBinding {
+  scope: 'actor' | 'system';
+  fingerprint: string | null;
+  actor: Actor | null;
+  actorJson: string | null;
+}
+
+/** Normalize optional SDK fields before hashing/forwarding. Extra passthrough
+ * properties are deliberately dropped: the Rust Actor contract is exactly
+ * user_id + claims + tenant_id. */
+export function actorBinding(actor: Actor | null | undefined): ActorBinding {
+  if (!actor) return { scope: 'system', fingerprint: null, actor: null, actorJson: null };
+  const canonical: Actor = {
+    user_id: actor.user_id,
+    claims: [...(actor.claims ?? [])],
+    tenant_id: actor.tenant_id ?? null,
+  };
+  const actorJson = JSON.stringify(canonical);
+  return {
+    scope: 'actor',
+    fingerprint: `sha256:${createHash('sha256').update(actorJson).digest('hex')}`,
+    actor: canonical,
+    actorJson,
+  };
+}
+
+/** The SDK intentionally extracts actors leniently. This boundary is stricter:
+ * a caller that supplied an `actor` key but failed typed extraction must not be
+ * silently downgraded to a system run. */
+export function validateRawActor(rawActor: unknown, actor: Actor | undefined, present = rawActor !== undefined): void {
+  if (present && !actor) {
+    throw new Error('environment actor is present but malformed; refusing system-scope downgrade');
+  }
+  if (actor && !present) {
+    throw new Error('environment actor context has no matching request actor');
+  }
+}
+
+function actorBindingMac(secret: string, handle: EnvironmentHandle, metadata: Record<string, unknown>): string {
+  return createHmac('sha256', secret)
+    .update('animus-environment-railway/actor-binding/v1\0')
+    .update(
+      JSON.stringify({
+        version: 1,
+        handle_id: handle.id,
+        service_id: metadata.service_id,
+        environment_id: metadata.environment_id,
+        scope: metadata.animus_actor_scope,
+        fingerprint: metadata.animus_actor_fingerprint,
+      }),
+    )
+    .digest('hex');
+}
+
+function bindingFromHandle(handle: EnvironmentHandle, secret: string): ActorBinding {
+  const metadata = handle.metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new Error(`environment handle '${handle.id}' has no actor binding metadata`);
+  }
+  const record = metadata as Record<string, unknown>;
+  const suppliedMac = record.animus_actor_binding_mac;
+  if (typeof suppliedMac !== 'string' || !/^[0-9a-f]{64}$/.test(suppliedMac)) {
+    throw new Error(`environment handle '${handle.id}' has malformed actor binding metadata`);
+  }
+  const expectedMac = actorBindingMac(secret, handle, record);
+  if (!timingSafeEqual(Buffer.from(suppliedMac, 'hex'), Buffer.from(expectedMac, 'hex'))) {
+    throw new Error(`environment handle '${handle.id}' has invalid actor binding signature`);
+  }
+  const scope = record.animus_actor_scope;
+  const fingerprint = record.animus_actor_fingerprint;
+  if (scope === 'system' && (fingerprint === null || fingerprint === undefined)) {
+    return actorBinding(null);
+  }
+  if (scope === 'actor' && typeof fingerprint === 'string' && /^sha256:[0-9a-f]{64}$/.test(fingerprint)) {
+    return { scope, fingerprint, actor: null, actorJson: null };
+  }
+  throw new Error(`environment handle '${handle.id}' has malformed actor binding metadata`);
+}
+
+function authorizeActor(expected: ActorBinding, handleId: string, actor: Actor | null | undefined): ActorBinding {
+  const actual = actorBinding(actor);
+  if (expected.scope !== actual.scope || expected.fingerprint !== actual.fingerprint) {
+    throw new Error(`environment exec_session actor does not match handle '${handleId}' binding`);
+  }
+  return actual;
+}
+
+function rewriteActor(params: unknown, binding: ActorBinding): unknown {
+  if (params === null || params === undefined) {
+    if (binding.actor) return { actor: binding.actor };
+    return params;
+  }
+  if (typeof params !== 'object' || Array.isArray(params)) {
+    if (binding.actor) {
+      throw new RelayRpcError(
+        RelayErrorCode.InvalidParams,
+        'actor-bound reverse RPC params must be an object',
+      );
+    }
+    return params;
+  }
+  const rewritten = { ...(params as Record<string, unknown>) };
+  if (binding.actor) rewritten.actor = binding.actor;
+  else delete rewritten.actor;
+  return rewritten;
+}
+
+/** Enforce the handle's trusted actor on every node-originated reverse RPC.
+ * `backend/call` wraps the role payload under its own `params`, so both the
+ * envelope and that forwarded payload are scrubbed. */
+export function makeActorBoundReverseHandler(
+  bindings: ReadonlyMap<string, ActorBinding>,
+  next: ReverseRpcHandler,
+): ReverseRpcHandler {
+  return async (method, params, ctx) => {
+    const binding = bindings.get(ctx.handleId);
+    if (!binding) {
+      throw new RelayRpcError(
+        RelayErrorCode.InvalidRequest,
+        `reverse RPC rejected for unknown or unbound environment handle '${ctx.handleId}'`,
+      );
+    }
+    const outer = rewriteActor(params, binding);
+    if (
+      method === 'backend/call' &&
+      outer !== null &&
+      typeof outer === 'object' &&
+      !Array.isArray(outer)
+    ) {
+      const envelope = outer as Record<string, unknown>;
+      return await next(method, { ...envelope, params: rewriteActor(envelope.params, binding) }, ctx);
+    }
+    return await next(method, outer, ctx);
+  };
 }
 
 /** The workflow run id a broker passes on `spec.metadata` so this plugin can
@@ -154,6 +310,13 @@ export interface RailwayHandleMeta {
    *  (e.g. `git add -A && git commit -m checkpoint && git push`). Sourced from
    *  `spec.metadata.cleanup`; absent for workflows that declare no cleanup. */
   cleanup?: string | null;
+  /** Actor authority marker. The actor body is never persisted in the handle;
+   * only its canonical SHA-256 fingerprint is retained for restart reattach. */
+  animus_actor_scope: 'actor' | 'system';
+  animus_actor_fingerprint: string | null;
+  /** HMAC over the handle identity, substrate target, and actor marker. Makes
+   * persisted metadata safe to use for restart reattachment. */
+  animus_actor_binding_mac: string;
 }
 
 export interface RailwayEnvironmentConfig {
@@ -201,6 +364,9 @@ export interface RailwayEnvironmentConfig {
    *  `git add -A && git commit && git push`). Sourced from `ANIMUS_ENV_CLEANUP`;
    *  a per-run `spec.metadata.cleanup` overrides it. */
   cleanup?: string;
+  /** Stable HMAC secret for signed actor-binding metadata. Defaults to the
+   * Railway token; configure explicitly to decouple secret rotation. */
+  actorBindingSecret?: string;
 }
 
 /** Read the config from the process env (the plugin's runtime posture). */
@@ -221,6 +387,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
     databaseUrl: env.BASE_DB_URL ?? env.DATABASE_URL,
     upstreamLogBin: env.ANIMUS_ENV_UPSTREAM_LOG_BIN,
     relaySocketPath: env.ANIMUS_ENV_RELAY_SOCK,
+    actorBindingSecret: env.ANIMUS_ENV_ACTOR_BINDING_SECRET ?? env.RAILWAY_TOKEN,
   };
 }
 
@@ -408,6 +575,7 @@ export function runVariables(args: {
   token: string;
   specEnv: Record<string, string> | undefined;
   hostEnv?: NodeJS.ProcessEnv;
+  actorJson?: string | null;
 }): Record<string, string> {
   const hostEnv = args.hostEnv ?? process.env;
   const vars: Record<string, string> = {};
@@ -415,6 +583,9 @@ export function runVariables(args: {
   // shared database endpoint the daemon itself uses.
   if (hostEnv.BASE_DB_URL) vars.BASE_DB_URL = hostEnv.BASE_DB_URL;
   Object.assign(vars, args.specEnv ?? {});
+  // Reserved authority channel: a workflow-authored spec can neither spoof an
+  // actor nor leave one on a system-scoped node.
+  delete vars[ACTOR_ENV];
   // The daemon's API fallback wins over spec.env so a dispatched task cannot
   // replace the configured provider endpoint or credential on its own node.
   for (const key of ANTHROPIC_FALLBACK_ENV_KEYS) {
@@ -428,6 +599,7 @@ export function runVariables(args: {
   vars.ANIMUS_ENV_WSS_URL = args.wssUrl;
   vars.ANIMUS_ENV_RUN_TOKEN = args.token;
   vars.ANIMUS_ENV_WORKSPACE_ROOT = WORKSPACE_ROOT;
+  if (args.actorJson) vars[ACTOR_ENV] = args.actorJson;
   return vars;
 }
 
@@ -571,7 +743,7 @@ export interface RailwayEnvironmentDeps {
   railway?: RailwayApi;
   /** Pre-started in-process relay (tests). Default: connect to the shared
    *  singleton via `RelayClient`. */
-  relay?: RelayServer;
+  relay?: RelayTransport;
   config?: RailwayEnvironmentConfig;
 }
 
@@ -580,6 +752,10 @@ export class RailwayEnvironment {
   private readonly config: RailwayEnvironmentConfig;
   private railwayApi: RailwayApi | null;
   private relayInstance: RelayTransport | null;
+  /** In-memory authority for live relay handles. Handle metadata is used only
+   * to rehydrate this map after a plugin restart, after matching ctx.actor. */
+  private readonly actorBindings = new Map<string, ActorBinding>();
+  private readonly actorBindingSecret: string;
   /** Random per-process identity baked into service names, so a GC sweep can
    *  distinguish this instance's runs from another live plugin instance's. */
   readonly instanceId: string = shortId('i');
@@ -591,6 +767,11 @@ export class RailwayEnvironment {
     this.config = deps.config ?? configFromEnv();
     this.railwayApi = deps.railway ?? null;
     this.relayInstance = deps.relay ?? null;
+    // A process-local fallback keeps live authorization safe in tests or
+    // injected deployments without credentials, but intentionally cannot
+    // reattach across restart. Production config derives a stable key from
+    // RAILWAY_TOKEN unless ANIMUS_ENV_ACTOR_BINDING_SECRET is explicit.
+    this.actorBindingSecret = this.config.actorBindingSecret?.trim() || randomBytes(32).toString('hex');
   }
 
   /** Lazily spawn the parent-side backend plugin a node's `backend/call` is
@@ -666,11 +847,14 @@ export class RailwayEnvironment {
         socketPath: this.config.relaySocketPath,
         ...(backend
           ? {
-              onReverseRpc: makeBackendCallHandler({
-                default: backend,
-                ...(logBackend ? { log_storage: logBackend } : {}),
-                credentials: makeCredentialsServicer(process.env),
-              }),
+              onReverseRpc: makeActorBoundReverseHandler(
+                this.actorBindings,
+                makeBackendCallHandler({
+                  default: backend,
+                  ...(logBackend ? { log_storage: logBackend } : {}),
+                  credentials: makeCredentialsServicer(process.env),
+                }),
+              ),
             }
           : {}),
       });
@@ -682,7 +866,13 @@ export class RailwayEnvironment {
    *  image with the relay coordinates injected, wait (bounded) for the
    *  container to dial home, then clone the planned repos and (optionally)
    *  `animus install`. */
-  async prepare(req: PrepareRequest): Promise<{ handle: EnvironmentHandle }> {
+  async prepare(
+    req: PrepareRequest,
+    actor?: Actor,
+    rawActor: unknown = (req as Record<string, unknown>).actor,
+    rawActorPresent = Object.prototype.hasOwnProperty.call(req, 'actor'),
+  ): Promise<{ handle: EnvironmentHandle }> {
+    validateRawActor(rawActor, actor, rawActorPresent);
     const spec = req.spec;
     const { projectId, environmentId } = resolveTarget(spec, this.config);
     const image = spec.image?.trim() || DEFAULT_IMAGE;
@@ -691,8 +881,14 @@ export class RailwayEnvironment {
     // per-instance prefix. The relay run id is kept random regardless so a repeat
     // prepare for the same run never collides on an already-registered relay run.
     const runId = specRunId(spec);
-    const id = shortId('r');
-    const serviceName = runId ? deterministicServiceName(projectId, runId) : `${this.instancePrefix()}${id}`;
+    const id = secureHandleId();
+    const binding = actorBinding(actor);
+    // Bind before register/create: a node can dial and issue reverse RPC as soon
+    // as Railway starts it, so no unbound authorization window may exist.
+    this.actorBindings.set(id, binding);
+    const serviceName = runId
+      ? deterministicServiceName(projectId, runId)
+      : `${this.instancePrefix()}${handleServiceToken(id)}`;
     // Reconcile before create: any pre-existing service with this run's
     // deterministic name is a leaked orphan from a failed earlier prepare of the
     // SAME run (nothing else can own that name), so delete it first to keep the
@@ -706,13 +902,17 @@ export class RailwayEnvironment {
       }
     }
 
-    const relay = await this.relay();
-    const { url, token } = await relay.registerRun(id);
-    const plan = planWorkspace(spec, WORKSPACE_ROOT);
-    // Validate every planned subdir up front (a spec-supplied repo `name` like
-    // `../outside` must never escape the workspace root or poison the default
-    // cwd metadata). Fail BEFORE creating the service.
+    let relay: RelayTransport | undefined;
+    let url: string;
+    let token: string;
+    let plan: WorkspacePlan;
     try {
+      relay = await this.relay();
+      ({ url, token } = await relay.registerRun(id));
+      plan = planWorkspace(spec, WORKSPACE_ROOT);
+      // Validate every planned subdir up front (a spec-supplied repo `name` like
+      // `../outside` must never escape the workspace root or poison the default
+      // cwd metadata). Fail BEFORE creating the service.
       if (!plan.single) for (const planned of plan.repos) assertSafeSubdir(planned.subdir);
       // A remote container cannot see the daemon host's filesystem: local-path
       // repo urls (the docker plugin bind-mounts these) are unsupported here.
@@ -725,7 +925,8 @@ export class RailwayEnvironment {
         }
       }
     } catch (err) {
-      relay.releaseRun(id);
+      relay?.releaseRun(id);
+      this.actorBindings.delete(id);
       throw err;
     }
 
@@ -744,7 +945,11 @@ export class RailwayEnvironment {
         environmentId,
         name: serviceName,
         image,
-        variables: { ...runVariables({ wssUrl: url, token, specEnv: spec.env }), ...claudeVars, ...appVars },
+        variables: {
+          ...runVariables({ wssUrl: url, token, specEnv: spec.env, actorJson: binding.actorJson }),
+          ...claudeVars,
+          ...appVars,
+        },
         startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
         registryCredentials: this.config.registryCredentials,
       });
@@ -780,6 +985,7 @@ export class RailwayEnvironment {
     } catch (err) {
       // Roll back the half-prepared run: forget the token, delete the service.
       relay.releaseRun(id);
+      this.actorBindings.delete(id);
       if (serviceId) {
         await this.railway()
           .deleteService(serviceId, environmentId)
@@ -797,7 +1003,7 @@ export class RailwayEnvironment {
         : this.config.cleanup && this.config.cleanup.trim().length > 0
           ? this.config.cleanup.trim()
           : null;
-    const metadata: RailwayHandleMeta = {
+    const unsignedMetadata = {
       service_id: serviceId,
       service_name: serviceName,
       project_id: projectId,
@@ -807,6 +1013,16 @@ export class RailwayEnvironment {
       primary_subdir: plan.primarySubdir,
       animus_run_id: runId,
       cleanup,
+      animus_actor_scope: binding.scope,
+      animus_actor_fingerprint: binding.fingerprint,
+    };
+    const metadata: RailwayHandleMeta = {
+      ...unsignedMetadata,
+      animus_actor_binding_mac: actorBindingMac(
+        this.actorBindingSecret,
+        { id, workspace_root: WORKSPACE_ROOT, metadata: unsignedMetadata },
+        unsignedMetadata,
+      ),
     };
     return { handle: { id, workspace_root: WORKSPACE_ROOT, metadata } };
   }
@@ -846,7 +1062,25 @@ export class RailwayEnvironment {
       workflow_id?: string | null;
     },
     onJournal?: (event: JournalEventParams) => void,
+    actor?: Actor,
+    rawActor?: unknown,
+    rawActorPresent = rawActor !== undefined,
   ): Promise<SessionResult> {
+    validateRawActor(rawActor, actor, rawActorPresent);
+    // A live map entry is authoritative and can never be overwritten from
+    // caller-supplied metadata. A restart may rehydrate only from a handle whose
+    // actor marker has a valid server-side HMAC, then only for the matching
+    // authenticated call actor.
+    const persisted = bindingFromHandle(handle, this.actorBindingSecret);
+    const live = this.actorBindings.get(handle.id);
+    if (
+      live &&
+      (live.scope !== persisted.scope || live.fingerprint !== persisted.fingerprint)
+    ) {
+      throw new Error(`environment handle '${handle.id}' actor binding metadata does not match live authority`);
+    }
+    const binding = authorizeActor(live ?? persisted, handle.id, actor);
+    if (!live) this.actorBindings.set(handle.id, binding);
     const relay = await this.relay();
     return relay.runSession(handle.id, params, onJournal);
   }
@@ -869,6 +1103,10 @@ export class RailwayEnvironment {
         // best-effort: a failed cleanup must not block node teardown
       }
     }
+    // Cleanup may itself need actor-bound reverse RPC (for example an on-demand
+    // credential call). Revoke authority immediately after that bounded hook,
+    // before releasing the relay registration or deleting the substrate node.
+    this.actorBindings.delete(handle.id);
     if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
     const environmentId = meta?.environment_id || this.config.environmentId;
     // Fast path: a full handle carries the service_id; delete it directly.
@@ -909,7 +1147,9 @@ export class RailwayEnvironment {
     if (!environmentId) throw new Error('gcOrphans needs an environment id (RAILWAY_ENVIRONMENT_ID or argument)');
     const services = await this.railway().listRunServices(target);
     const liveHandles = new Set(
-      (this.relayInstance?.registeredRuns() ?? []).map((h) => `${this.instancePrefix()}${h}`),
+      (this.relayInstance?.registeredRuns() ?? []).map(
+        (handleId) => `${this.instancePrefix()}${handleServiceToken(handleId)}`,
+      ),
     );
     const removed: string[] = [];
     for (const svc of services) {
@@ -991,7 +1231,9 @@ export class RailwayEnvironment {
     // in the resident daemon), and (2) the daemon-supplied live run ids mapped to
     // their deterministic service names (works from a fresh CLI process too).
     const liveNames = new Set(
-      (this.relayInstance?.registeredRuns() ?? []).map((h) => `${this.instancePrefix()}${h}`),
+      (this.relayInstance?.registeredRuns() ?? []).map(
+        (handleId) => `${this.instancePrefix()}${handleServiceToken(handleId)}`,
+      ),
     );
     const ownerKnown = opts.liveRunIds !== undefined;
     for (const rid of opts.liveRunIds ?? []) liveNames.add(deterministicServiceName(projectId, rid));
@@ -1084,6 +1326,7 @@ export class RailwayEnvironment {
 
   /** Close the relay listener + any parent-side backend plugins (tests / shutdown). */
   async close(): Promise<void> {
+    this.actorBindings.clear();
     if (this.relayInstance) {
       await this.relayInstance.close();
       this.relayInstance = null;
