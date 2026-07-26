@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.11',
+  version: '0.4.17',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -98,9 +98,35 @@ const plugin = defineEnvironmentPlugin({
       required: false,
     },
     {
+      name: 'ANIMUS_ENV_CLEANUP',
+      description:
+        'Default cleanup script (sh -c) run IN every node right before teardown, to flush uncommitted work to its branch (e.g. `git add -A && git commit -m checkpoint && git push origin HEAD || true`). Best-effort + bounded; a per-run spec.metadata.cleanup overrides it.',
+      required: false,
+    },
+    {
       name: 'CLAUDE_CONFIG_DIR',
       description:
         'Daemon-side dir holding the Claude subscription .credentials.json; base64-injected into each node so the claude harness runs on the subscription.',
+      required: false,
+    },
+    {
+      name: 'ANTHROPIC_AUTH_TOKEN',
+      description:
+        'Anthropic-compatible bearer token passed to run nodes as the fallback when the shared Claude subscription credential is missing, expired, or invalid.',
+      required: false,
+      sensitive: true,
+    },
+    {
+      name: 'ANTHROPIC_API_KEY',
+      description:
+        'Anthropic API key passed to run nodes as an optional fallback when the shared Claude subscription credential is unavailable.',
+      required: false,
+      sensitive: true,
+    },
+    {
+      name: 'ANTHROPIC_BASE_URL',
+      description:
+        'Anthropic-compatible API base URL passed to run nodes with ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY.',
       required: false,
     },
     {
@@ -145,7 +171,12 @@ const plugin = defineEnvironmentPlugin({
   execSession: async (params, emit) => {
     const result = await env.runSession(
       params.handle,
-      { subject_id: params.subject_id, workflow_ref: params.workflow_ref, dispatch_input: params.dispatch_input, workflow_id: params.workflow_id },
+      {
+        subject_id: params.subject_id,
+        workflow_ref: params.workflow_ref,
+        dispatch_input: params.dispatch_input,
+        workflow_id: params.workflow_id,
+      },
       (ev) =>
         emit({
           kind: 'journal',
@@ -165,6 +196,23 @@ const plugin = defineEnvironmentPlugin({
   teardown: async (params) => {
     await env.teardown(params.handle);
     return {};
+  },
+
+  listNodes: async () => ({ nodes: await env.listNodes() }),
+
+  getNode: async (params) => ({ node: await env.getNode(params.id) }),
+
+  teardownNode: async (params) => ({ deleted: await env.teardownNode(params.id) }),
+
+  reapNodes: async (params) => {
+    const r = await env.reap({
+      all: params.all,
+      force: params.force,
+      dryRun: params.dry_run,
+      olderThanSecs: params.older_than_secs,
+      liveRunIds: params.live_run_ids,
+    });
+    return { deleted: r.deleted, kept: r.kept, dry_run: r.dryRun };
   },
 
   // Surface missing Railway credentials/config at preflight instead of on the

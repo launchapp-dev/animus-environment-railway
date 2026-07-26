@@ -18,6 +18,15 @@ export const RAILWAY_GQL_ENDPOINT = 'https://backboard.railway.com/graphql/v2';
  *  name (Railway has no free-form service labels). */
 export const SERVICE_NAME_PREFIX = 'animus-run-';
 
+/** Railway latest-deployment states that mean a run service is dead: it can
+ *  never be a healthy live node, so `reap` may always delete it. */
+export const DEAD_DEPLOYMENT_STATES: ReadonlySet<string> = new Set([
+  'FAILED',
+  'CRASHED',
+  'REMOVED',
+  'REMOVING',
+]);
+
 export interface GraphQLRequest {
   query: string;
   variables: Record<string, unknown>;
@@ -105,6 +114,30 @@ export function buildProjectServicesRequest(args: { projectId: string }): GraphQ
   };
 }
 
+/** Like {@link buildProjectServicesRequest} but also pulls each service's LATEST
+ *  deployment status + createdAt, so the node-management surface can report
+ *  state and `reap` can target dead deployments. */
+export function buildProjectServicesDetailedRequest(args: { projectId: string }): GraphQLRequest {
+  return {
+    query: `query projectServicesDetailed($id: String!) {
+  project(id: $id) {
+    services {
+      edges {
+        node {
+          id
+          name
+          deployments(first: 1) {
+            edges { node { id status createdAt } }
+          }
+        }
+      }
+    }
+  }
+}`,
+    variables: { id: args.projectId },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Substrate-facing API surface (mockable seam for the environment tests)
 
@@ -114,6 +147,17 @@ export interface CreatedService {
   deploymentId?: string | null;
 }
 
+/** An `animus-run-*` service plus its latest-deployment state (node-management). */
+export interface RunServiceDetail {
+  id: string;
+  name: string;
+  /** Latest deployment status (Railway `DeploymentStatus`), or null when the
+   *  service has no deployment yet / the field was unavailable. */
+  status: string | null;
+  /** Latest deployment createdAt (ISO 8601), or null. */
+  createdAt: string | null;
+}
+
 export interface RailwayApi {
   /** Create + configure + deploy a run service. Returns its ids. */
   createRunService(input: ServiceCreateInput & { startCommand: string }): Promise<CreatedService>;
@@ -121,6 +165,9 @@ export interface RailwayApi {
   deleteService(serviceId: string, environmentId: string): Promise<void>;
   /** List `animus-run-*` services in the project (GC sweep input). */
   listRunServices(projectId: string): Promise<Array<{ id: string; name: string }>>;
+  /** List `animus-run-*` services WITH their latest-deployment state. Optional —
+   *  callers fall back to {@link listRunServices} (no state) when absent. */
+  listRunServicesDetailed?(projectId: string): Promise<RunServiceDetail[]>;
 }
 
 export class RailwayApiError extends Error {
@@ -238,5 +285,34 @@ export class RailwayClient implements RailwayApi {
     }>(buildProjectServicesRequest({ projectId }));
     const edges = data.project?.services?.edges ?? [];
     return edges.map((e) => e.node).filter((n) => n.name.startsWith(SERVICE_NAME_PREFIX));
+  }
+
+  async listRunServicesDetailed(projectId: string): Promise<RunServiceDetail[]> {
+    const data = await this.execute<{
+      project: {
+        services: {
+          edges: Array<{
+            node: {
+              id: string;
+              name: string;
+              deployments?: { edges: Array<{ node: { id: string; status?: string | null; createdAt?: string | null } }> };
+            };
+          }>;
+        };
+      };
+    }>(buildProjectServicesDetailedRequest({ projectId }));
+    const edges = data.project?.services?.edges ?? [];
+    return edges
+      .map((e) => e.node)
+      .filter((n) => n.name.startsWith(SERVICE_NAME_PREFIX))
+      .map((n) => {
+        const latest = n.deployments?.edges?.[0]?.node;
+        return {
+          id: n.id,
+          name: n.name,
+          status: latest?.status ?? null,
+          createdAt: latest?.createdAt ?? null,
+        };
+      });
   }
 }

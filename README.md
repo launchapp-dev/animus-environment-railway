@@ -43,6 +43,14 @@ See `plugin.toml` for the full env surface. Minimum for real runs:
 routes to this plugin's relay port). Per-run overrides:
 `spec.metadata.railway_project_id` / `railway_environment_id`.
 
+Claude authentication prefers the shared subscription credential in
+`CLAUDE_CONFIG_DIR`. The daemon refreshes that credential centrally and only
+passes its short-lived access token to a node. When the subscription login is
+missing, expired without a refresh token, or invalid, the plugin instead
+passes the daemon's `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` and optional
+`ANTHROPIC_BASE_URL`. These fallback values are daemon-authoritative and cannot
+be replaced by a task's `spec.env`.
+
 ## Status
 
 - **Unit-tested** (no creds needed): GraphQL request builders + client over a
