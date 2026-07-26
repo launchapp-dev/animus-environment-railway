@@ -12,11 +12,16 @@ import { createHash, generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { BridgeClient, RelayServer } from '@launchapp-dev/animus-env-transport';
-import { planWorkspace } from '@launchapp-dev/animus-environment-base';
+import {
+  defineEnvironmentPlugin,
+  planWorkspace,
+  type EnvironmentPluginSpec,
+} from '@launchapp-dev/animus-environment-base';
 
 import {
   claudeNodeCredentials,
@@ -28,10 +33,14 @@ import {
   githubAppCredentials,
   harnessCredentialVars,
   logStorageEnv,
+  actorBinding,
+  makeActorBoundReverseHandler,
   parseGithubSlug,
   RailwayEnvironment,
+  type RelayTransport,
   resolveTarget,
   runVariables,
+  ACTOR_ENV,
   WORKSPACE_ROOT,
 } from './environment.js';
 import {
@@ -93,9 +102,89 @@ class FakeRailway implements RailwayApi {
   }
 }
 
+class RecordingRelay implements RelayTransport {
+  readonly sessions: Array<{ handleId: string; params: Record<string, unknown> }> = [];
+  private readonly handles = new Set<string>();
+
+  registerRun(handleId = 'relay-handle'): { url: string; token: string } {
+    this.handles.add(handleId);
+    return { url: `ws://relay/relay/${handleId}`, token: `token-${handleId}` };
+  }
+
+  async waitForConnection(): Promise<void> {}
+
+  async exec(): Promise<{ exit_code: number; stdout: string; stderr: string; timed_out: boolean }> {
+    return { exit_code: 0, stdout: '', stderr: '', timed_out: false };
+  }
+
+  async runSession(
+    handleId: string,
+    params: Record<string, unknown>,
+  ): Promise<{ workflow_id: string | null; status: string }> {
+    this.sessions.push({ handleId, params });
+    return { workflow_id: typeof params.workflow_id === 'string' ? params.workflow_id : null, status: 'completed' };
+  }
+
+  releaseRun(handleId: string): void {
+    this.handles.delete(handleId);
+  }
+
+  registeredRuns(): string[] {
+    return [...this.handles];
+  }
+
+  async close(): Promise<void> {
+    this.handles.clear();
+  }
+}
+
 interface Ctx {
   env: RailwayEnvironment;
   fake: FakeRailway;
+}
+
+interface RpcFrame {
+  jsonrpc: '2.0';
+  id?: number | string | null;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+async function drivePlugin(
+  impl: Omit<EnvironmentPluginSpec, 'input' | 'output' | 'skipCliArgs' | 'name' | 'version' | 'description'>,
+  frames: RpcFrame[],
+): Promise<RpcFrame[]> {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const out: RpcFrame[] = [];
+  let buffered = '';
+  output.on('data', (chunk: Buffer) => {
+    buffered += chunk.toString('utf8');
+    let newline = buffered.indexOf('\n');
+    while (newline !== -1) {
+      const line = buffered.slice(0, newline).trim();
+      buffered = buffered.slice(newline + 1);
+      if (line) out.push(JSON.parse(line) as RpcFrame);
+      newline = buffered.indexOf('\n');
+    }
+  });
+
+  const plugin = defineEnvironmentPlugin({
+    name: 'animus-environment-railway-dispatch-test',
+    version: '0.0.0',
+    description: 'Railway actor dispatch regression harness',
+    skipCliArgs: true,
+    input,
+    output,
+    ...impl,
+  });
+  const done = plugin.run();
+  for (const frame of frames) input.write(`${JSON.stringify(frame)}\n`);
+  input.end();
+  await done;
+  return out;
 }
 
 const live: Ctx[] = [];
@@ -160,6 +249,76 @@ describe('pure helpers', () => {
       ANIMUS_ENV_RUN_TOKEN: 'tok', // relay identity wins over spec env
       ANIMUS_ENV_WORKSPACE_ROOT: WORKSPACE_ROOT,
     });
+  });
+
+  it('reserves the workflow actor env from spec spoofing', () => {
+    const alice = actorBinding({ user_id: 'alice', claims: ['admin'], tenant_id: 'acme' });
+    const scoped = runVariables({
+      wssUrl: 'wss://relay/relay/h1',
+      token: 'tok',
+      specEnv: { [ACTOR_ENV]: '{"user_id":"mallory"}' },
+      hostEnv: {} as NodeJS.ProcessEnv,
+      actorJson: alice.actorJson,
+    });
+    expect(scoped[ACTOR_ENV]).toBe(alice.actorJson);
+
+    const system = runVariables({
+      wssUrl: 'wss://relay/relay/h2',
+      token: 'tok-2',
+      specEnv: { [ACTOR_ENV]: '{"user_id":"mallory"}' },
+      hostEnv: {} as NodeJS.ProcessEnv,
+    });
+    expect(system[ACTOR_ENV]).toBeUndefined();
+  });
+
+  it('overwrites node-supplied actors on reverse calls and strips them for system handles', async () => {
+    const actor = actorBinding({ user_id: 'alice', claims: ['admin'], tenant_id: 'acme' });
+    const system = actorBinding(null);
+    const seen: unknown[] = [];
+    const next = async (_method: string, params: unknown): Promise<unknown> => {
+      seen.push(params);
+      return { ok: true };
+    };
+    const handler = makeActorBoundReverseHandler(
+      new Map([
+        ['actor-handle', actor],
+        ['system-handle', system],
+      ]),
+      next,
+    );
+
+    await handler(
+      'backend/call',
+      {
+        role: 'subject',
+        method: 'subject/get',
+        actor: { user_id: 'outer-spoof' },
+        params: { id: 'TASK-1', actor: { user_id: 'mallory' } },
+      },
+      { handleId: 'actor-handle' },
+    );
+    expect(seen[0]).toEqual({
+      role: 'subject',
+      method: 'subject/get',
+      actor: actor.actor,
+      params: { id: 'TASK-1', actor: actor.actor },
+    });
+
+    await handler(
+      'backend/call',
+      {
+        role: 'subject',
+        method: 'subject/get',
+        actor: { user_id: 'outer-spoof' },
+        params: { id: 'TASK-2', actor: { user_id: 'mallory' } },
+      },
+      { handleId: 'system-handle' },
+    );
+    expect(seen[1]).toEqual({ role: 'subject', method: 'subject/get', params: { id: 'TASK-2' } });
+
+    await expect(
+      handler('backend/call', { role: 'subject', method: 'subject/get', params: {} }, { handleId: 'unknown' }),
+    ).rejects.toThrow(/unknown or unbound/);
   });
 
   it('harnessCredentialVars base64s the codex auth + passes the github token', () => {
@@ -499,6 +658,15 @@ describe('pure helpers', () => {
       relayPort: 8790,
       dialTimeoutSecs: 60,
     });
+    expect(configFromEnv({ RAILWAY_TOKEN: 'railway-secret' } as NodeJS.ProcessEnv).actorBindingSecret).toBe(
+      'railway-secret',
+    );
+    expect(
+      configFromEnv({
+        RAILWAY_TOKEN: 'railway-secret',
+        ANIMUS_ENV_ACTOR_BINDING_SECRET: 'dedicated-secret',
+      } as NodeJS.ProcessEnv).actorBindingSecret,
+    ).toBe('dedicated-secret');
   });
 });
 
@@ -507,13 +675,13 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const { env, fake } = await makeEnv();
 
     const { handle } = await env.prepare({ spec: { kind: 'railway', env: { RUN_FLAG: 'yes' } } });
-    expect(handle.id).toMatch(/^r[0-9a-f]{6}$/);
+    expect(handle.id).toMatch(/^r[0-9a-f]{32}$/);
     expect(handle.workspace_root).toBe(WORKSPACE_ROOT);
     const meta = handle.metadata as Record<string, unknown>;
     expect(meta.service_id).toBe('svc-1');
     expect(meta.project_id).toBe('proj-1');
     expect(meta.environment_id).toBe('env-1');
-    expect(String(meta.service_name)).toBe(`${SERVICE_NAME_PREFIX}${env.instanceId}-${handle.id}`);
+    expect(String(meta.service_name)).toBe(`${SERVICE_NAME_PREFIX}${env.instanceId}-${handle.id.slice(0, 11)}`);
 
     // The service was created from the default image with the bridge command
     // and the injected relay coordinates + spec env.
@@ -686,7 +854,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const { env, fake } = await makeEnv();
     const { handle } = await env.prepare({ spec: { kind: 'railway' } });
     fake.listed = [
-      { id: 'svc-live', name: `${SERVICE_NAME_PREFIX}${env.instanceId}-${handle.id}` },
+      { id: 'svc-live', name: `${SERVICE_NAME_PREFIX}${env.instanceId}-${handle.id.slice(0, 11)}` },
       { id: 'svc-orphan-mine', name: `${SERVICE_NAME_PREFIX}${env.instanceId}-dead-run` },
       { id: 'svc-other-instance', name: `${SERVICE_NAME_PREFIX}i-other-live-run` },
       { id: 'svc-unrelated', name: 'postgres' },
@@ -701,7 +869,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const { env, fake } = await makeEnv();
     const { handle } = await env.prepare({ spec: { kind: 'railway' } });
     fake.listed = [
-      { id: 'svc-live', name: `${SERVICE_NAME_PREFIX}${env.instanceId}-${handle.id}` },
+      { id: 'svc-live', name: `${SERVICE_NAME_PREFIX}${env.instanceId}-${handle.id.slice(0, 11)}` },
       { id: 'svc-crashed-instance', name: `${SERVICE_NAME_PREFIX}i-dead-instance-run` },
     ];
     const removed = await env.gcOrphans({ allInstances: true });
@@ -838,6 +1006,263 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
   // process (animus-env-relay), not this plugin — the two former tests that
   // asserted this plugin binds/validates the port were removed with that move.
   // The singleton's own port validation lives in relay-cli (env-transport).
+});
+
+describe('prepare -> exec_session actor binding', () => {
+  const alice = { user_id: 'alice', claims: ['admin'], tenant_id: 'acme' };
+  const bob = { user_id: 'bob', claims: [], tenant_id: 'acme' };
+
+  async function boundEnvironment(actor?: typeof alice, specActor = actor): Promise<{
+    env: RailwayEnvironment;
+    fake: FakeRailway;
+    relay: RecordingRelay;
+    handle: Awaited<ReturnType<RailwayEnvironment['prepare']>>['handle'];
+  }> {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        dialTimeoutSecs: 1,
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env, fake });
+    const request = {
+      spec: {
+        kind: 'railway',
+        env: { [ACTOR_ENV]: '{"user_id":"mallory"}' },
+      },
+      ...(specActor === undefined ? {} : { actor: specActor }),
+    };
+    const { handle } = await env.prepare(
+      request,
+      actor,
+      specActor,
+      Object.prototype.hasOwnProperty.call(request, 'actor'),
+    );
+    return { env, fake, relay, handle };
+  }
+
+  it('injects only the context actor and accepts that same actor for exec_session', async () => {
+    const { env, fake, relay, handle } = await boundEnvironment(alice);
+    expect(handle.id).toMatch(/^r[0-9a-f]{32}$/);
+    expect(JSON.parse(fake.created[0]?.variables[ACTOR_ENV] ?? '{}')).toEqual(alice);
+    expect(handle.metadata).toMatchObject({
+      animus_actor_scope: 'actor',
+      animus_actor_fingerprint: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+    });
+
+    await expect(
+      env.runSession(
+        handle,
+        { subject_id: 'task:TASK-1', workflow_id: 'wf-1' },
+        undefined,
+        alice,
+        alice,
+        true,
+      ),
+    ).resolves.toEqual({ workflow_id: 'wf-1', status: 'completed' });
+    expect(relay.sessions).toHaveLength(1);
+  });
+
+  it('rejects omitted, mismatched, and malformed actors for an actor-bound handle', async () => {
+    const { env, handle } = await boundEnvironment(alice);
+    await expect(
+      env.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, undefined, undefined, false),
+    ).rejects.toThrow(/does not match/);
+    await expect(
+      env.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, bob, bob, true),
+    ).rejects.toThrow(/does not match/);
+    await expect(
+      env.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, undefined, { user_id: 42 }, true),
+    ).rejects.toThrow(/present but malformed/);
+
+    const malformedHandle = {
+      ...handle,
+      metadata: { ...(handle.metadata as Record<string, unknown>), animus_actor_fingerprint: 'not-a-hash' },
+    };
+    await expect(
+      env.runSession(malformedHandle, { subject_id: 'task:TASK-1' }, undefined, alice, alice, true),
+    ).rejects.toThrow(/invalid actor binding signature/);
+
+    const legacyHandle = { ...handle, metadata: { service_id: 'legacy' } };
+    await expect(
+      env.runSession(legacyHandle, { subject_id: 'task:TASK-1' }, undefined, undefined, undefined, false),
+    ).rejects.toThrow(/malformed actor binding metadata/);
+  });
+
+  it('does not let forged handle metadata overwrite a live actor binding', async () => {
+    const { env, handle, relay } = await boundEnvironment(alice);
+    const forged = {
+      ...handle,
+      metadata: {
+        ...(handle.metadata as Record<string, unknown>),
+        animus_actor_fingerprint: actorBinding(bob).fingerprint,
+      },
+    };
+    await expect(
+      env.runSession(forged, { subject_id: 'task:TASK-1' }, undefined, bob, bob, true),
+    ).rejects.toThrow(/invalid actor binding signature|does not match live authority/);
+    await expect(
+      env.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, alice, alice, true),
+    ).resolves.toMatchObject({ status: 'completed' });
+    expect(relay.sessions).toHaveLength(1);
+  });
+
+  it('rehydrates only metadata signed by the same stable server secret', async () => {
+    const { handle, relay } = await boundEnvironment(alice);
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+    await expect(
+      restarted.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, alice, alice, true),
+    ).resolves.toMatchObject({ status: 'completed' });
+
+    const otherFake = new FakeRailway();
+    otherFake.bootBridge = false;
+    const wrongSecret = new RailwayEnvironment({
+      railway: otherFake,
+      relay: new RecordingRelay(),
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'different-secret',
+      },
+    });
+    live.push({ env: wrongSecret, fake: otherFake });
+    await expect(
+      wrongSecret.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, alice, alice, true),
+    ).rejects.toThrow(/invalid actor binding signature/);
+  });
+
+  it('rejects malformed prepare actors before creating a service', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay: new RecordingRelay(),
+      config: { projectId: 'proj-1', environmentId: 'env-1' },
+    });
+    live.push({ env, fake });
+    await expect(
+      env.prepare(
+        { spec: { kind: 'railway' }, actor: { user_id: 42 } } as never,
+        undefined,
+        { user_id: 42 },
+        true,
+      ),
+    ).rejects.toThrow(/present but malformed/);
+    await expect(
+      env.prepare({ spec: { kind: 'railway' }, actor: null } as never, undefined, null, true),
+    ).rejects.toThrow(/present but malformed/);
+    expect(fake.created).toHaveLength(0);
+  });
+
+  it('preserves explicit system scope while stripping a spec actor spoof', async () => {
+    const { env, fake, handle } = await boundEnvironment(undefined);
+    expect(fake.created[0]?.variables[ACTOR_ENV]).toBeUndefined();
+    expect(handle.metadata).toMatchObject({
+      animus_actor_scope: 'system',
+      animus_actor_fingerprint: null,
+    });
+    await expect(
+      env.runSession(handle, { subject_id: 'task:TASK-2' }, undefined, undefined, undefined, false),
+    ).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('preserves valid and malformed actor presence through actual SDK dispatch', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'dispatch-test-secret',
+      },
+    });
+    live.push({ env, fake });
+    const impl = {
+      prepare: (params: Parameters<EnvironmentPluginSpec['prepare']>[0], ctx: Parameters<EnvironmentPluginSpec['prepare']>[1]) =>
+        env.prepare(
+          params,
+          ctx.actor,
+          (params as Record<string, unknown>).actor,
+          Object.prototype.hasOwnProperty.call(params, 'actor'),
+        ),
+      exec: () => ({ exit_code: 0, stdout: '', stderr: '', timed_out: false }),
+      execSession: async (
+        params: Parameters<NonNullable<EnvironmentPluginSpec['execSession']>>[0],
+        _emit: Parameters<NonNullable<EnvironmentPluginSpec['execSession']>>[1],
+        ctx: Parameters<NonNullable<EnvironmentPluginSpec['execSession']>>[2],
+      ) => {
+        const result = await env.runSession(
+          params.handle,
+          {
+            subject_id: params.subject_id,
+            workflow_ref: params.workflow_ref,
+            dispatch_input: params.dispatch_input,
+            workflow_id: params.workflow_id,
+          },
+          undefined,
+          ctx.actor,
+          (params as Record<string, unknown>).actor,
+          Object.prototype.hasOwnProperty.call(params, 'actor'),
+        );
+        return { workflow_id: result.workflow_id, status: result.status };
+      },
+      teardown: () => ({}),
+    };
+
+    const prepareOut = await drivePlugin(impl, [
+      { jsonrpc: '2.0', id: 1, method: 'environment/prepare', params: { spec: { kind: 'railway' }, actor: alice } },
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'environment/prepare',
+        params: { spec: { kind: 'railway' }, actor: { user_id: 42 } },
+      },
+    ]);
+    const prepared = prepareOut.find((frame) => frame.id === 1)?.result as { handle: { id: string } };
+    expect(prepared.handle.id).toMatch(/^r[0-9a-f]{32}$/);
+    expect(prepareOut.find((frame) => frame.id === 2)?.error?.message).toMatch(/present but malformed/);
+
+    const sessionOut = await drivePlugin(impl, [
+      {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'environment/exec_session',
+        params: { handle: prepared.handle, subject_id: 'task:TASK-1', workflow_id: 'wf-dispatch', actor: alice },
+      },
+      {
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'environment/exec_session',
+        params: { handle: prepared.handle, subject_id: 'task:TASK-1', actor: { user_id: 42 } },
+      },
+    ]);
+    expect(sessionOut.find((frame) => frame.id === 3)?.result).toEqual({
+      workflow_id: 'wf-dispatch',
+      status: 'completed',
+    });
+    expect(sessionOut.find((frame) => frame.id === 4)?.error?.message).toMatch(/present but malformed/);
+  });
 });
 
 // ---------------------------------------------------------------------------

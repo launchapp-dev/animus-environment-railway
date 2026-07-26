@@ -43,6 +43,12 @@ See `plugin.toml` for the full env surface. Minimum for real runs:
 routes to this plugin's relay port). Per-run overrides:
 `spec.metadata.railway_project_id` / `railway_environment_id`.
 
+`exec_session` actor authority is bound at prepare time. The plugin injects
+only the SDK-authenticated actor as `ANIMUS_ACTOR_JSON`, signs the persisted
+handle marker for restart-safe reattachment, and enforces the same actor on
+node-originated reverse RPC. `ANIMUS_ENV_ACTOR_BINDING_SECRET` may provide a
+dedicated stable signing key; when omitted, `RAILWAY_TOKEN` is used.
+
 Claude authentication prefers the shared subscription credential in
 `CLAUDE_CONFIG_DIR`. The daemon refreshes that credential centrally and only
 passes its short-lived access token to a node. When the subscription login is
