@@ -9,7 +9,7 @@
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
 import { createHash, generateKeyPairSync } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -34,7 +34,13 @@ import {
   runVariables,
   WORKSPACE_ROOT,
 } from './environment.js';
-import { SERVICE_NAME_PREFIX, type CreatedService, type RailwayApi, type ServiceCreateInput } from './railway.js';
+import {
+  SERVICE_NAME_PREFIX,
+  type CreatedService,
+  type RailwayApi,
+  type RunServiceDetail,
+  type ServiceCreateInput,
+} from './railway.js';
 
 const NODE = process.execPath;
 
@@ -74,6 +80,12 @@ class FakeRailway implements RailwayApi {
 
   async listRunServices(): Promise<Array<{ id: string; name: string }>> {
     return this.listed;
+  }
+
+  /** Set to drive the state-aware node-management surface (list/get/reap). */
+  detailed: RunServiceDetail[] | null = null;
+  async listRunServicesDetailed(): Promise<RunServiceDetail[]> {
+    return this.detailed ?? this.listed.map((s) => ({ ...s, status: null, createdAt: null }));
   }
 
   closeBridges(): void {
@@ -121,16 +133,29 @@ describe('pure helpers', () => {
     expect(() => resolveTarget({ kind: 'railway' }, {})).toThrow(/RAILWAY_PROJECT_ID/);
   });
 
-  it('runVariables layers BASE_DB_URL + spec.env under the relay coordinates', () => {
+  it('runVariables layers daemon auth + BASE_DB_URL over spec.env and under relay coordinates', () => {
     const vars = runVariables({
       wssUrl: 'wss://relay/relay/h1',
       token: 'tok',
-      specEnv: { FOO: 'bar', ANIMUS_ENV_RUN_TOKEN: 'spoofed' },
-      hostEnv: { BASE_DB_URL: 'postgres://db' } as NodeJS.ProcessEnv,
+      specEnv: {
+        FOO: 'bar',
+        ANIMUS_ENV_RUN_TOKEN: 'spoofed',
+        ANTHROPIC_AUTH_TOKEN: 'spoofed-anthropic-token',
+        ANTHROPIC_BASE_URL: 'https://spoofed.invalid',
+      },
+      hostEnv: {
+        BASE_DB_URL: 'postgres://db',
+        ANTHROPIC_AUTH_TOKEN: 'daemon-anthropic-token',
+        ANTHROPIC_API_KEY: 'daemon-anthropic-key',
+        ANTHROPIC_BASE_URL: 'https://provider.example/v1',
+      } as NodeJS.ProcessEnv,
     });
     expect(vars).toEqual({
       BASE_DB_URL: 'postgres://db',
       FOO: 'bar',
+      ANTHROPIC_AUTH_TOKEN: 'daemon-anthropic-token',
+      ANTHROPIC_API_KEY: 'daemon-anthropic-key',
+      ANTHROPIC_BASE_URL: 'https://provider.example/v1',
       ANIMUS_ENV_WSS_URL: 'wss://relay/relay/h1',
       ANIMUS_ENV_RUN_TOKEN: 'tok', // relay identity wins over spec env
       ANIMUS_ENV_WORKSPACE_ROOT: WORKSPACE_ROOT,
@@ -200,6 +225,33 @@ describe('pure helpers', () => {
     const failing = (async () => ({ ok: false, status: 400, json: async () => ({}), text: async () => 'invalid_grant' })) as unknown as typeof fetch;
     expect(await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, 1_000_000, failing)).toEqual({});
     expect(await claudeNodeCredentials({} as NodeJS.ProcessEnv, 1_000_000)).toEqual({});
+  });
+
+  it('claudeNodeCredentials rejects an empty unexpired access token', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    const now = 1_000_000;
+    writeFileSync(
+      join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: now + 3_600_000 } }),
+    );
+    expect(await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now)).toEqual({});
+  });
+
+  it('claudeNodeCredentials rejects a refresh response without an access token', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-'));
+    const now = 1_000_000;
+    writeFileSync(
+      join(dir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'old', refreshToken: 'R', expiresAt: now - 1 } }),
+    );
+    const missingAccessToken = (async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ expires_in: 3600 }),
+    })) as unknown as typeof fetch;
+    expect(
+      await claudeNodeCredentials({ CLAUDE_CONFIG_DIR: dir } as NodeJS.ProcessEnv, now, missingAccessToken),
+    ).toEqual({});
   });
 
   it('parseGithubSlug extracts owner/repo from https / ssh / .git urls', () => {
@@ -536,6 +588,76 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.deleted).toEqual([{ serviceId: 'svc-match', environmentId: 'env-1' }]);
   });
 
+  it('teardown runs the workflow cleanup hook IN the node before deleting the service', async () => {
+    const { env, fake } = await makeEnv();
+    const dir = mkdtempSync(join(tmpdir(), 'cleanup-'));
+    const marker = join(dir, 'ran.marker');
+    const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { cleanup: `echo done > ${marker}` } } });
+    // The workflow-declared cleanup is stored on the handle.
+    expect((handle.metadata as Record<string, unknown>).cleanup).toBe(`echo done > ${marker}`);
+    await env.teardown(handle);
+    // The fake bridge executed the cleanup in the node (flushing work) BEFORE the
+    // service was deleted — proving push-before-teardown is possible.
+    expect(readFileSync(marker, 'utf8').trim()).toBe('done');
+    expect(fake.deleted.map((d) => d.serviceId)).toContain('svc-1');
+  });
+
+  it('teardown with no cleanup hook declared deletes the service as before', async () => {
+    const { env, fake } = await makeEnv();
+    const { handle } = await env.prepare({ spec: { kind: 'railway' } });
+    expect((handle.metadata as Record<string, unknown>).cleanup).toBeNull();
+    await env.teardown(handle);
+    expect(fake.deleted.length).toBeGreaterThan(0);
+  });
+
+  it('a failing cleanup hook never blocks teardown (best-effort)', async () => {
+    const { env, fake } = await makeEnv();
+    const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { cleanup: 'exit 3' } } });
+    await expect(env.teardown(handle)).resolves.toBeUndefined();
+    expect(fake.deleted.map((d) => d.serviceId)).toContain('svc-1');
+  });
+
+  it('teardown falls back to the global ANIMUS_ENV_CLEANUP default when no per-run cleanup is set', async () => {
+    const fake = new FakeRailway();
+    const relay = await RelayServer.listen({ host: '127.0.0.1', port: 0 });
+    const dir = mkdtempSync(join(tmpdir(), 'cleanup-cfg-'));
+    const marker = join(dir, 'ran.marker');
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: { projectId: 'proj-1', environmentId: 'env-1', dialTimeoutSecs: 10, cleanup: `echo global > ${marker}` },
+    });
+    live.push({ env, fake });
+    const { handle } = await env.prepare({ spec: { kind: 'railway' } });
+    await env.teardown(handle);
+    expect(readFileSync(marker, 'utf8').trim()).toBe('global');
+  });
+
+  it('a per-run spec.metadata.cleanup overrides the global default', async () => {
+    const fake = new FakeRailway();
+    const relay = await RelayServer.listen({ host: '127.0.0.1', port: 0 });
+    const dir = mkdtempSync(join(tmpdir(), 'cleanup-ovr-'));
+    const globalMarker = join(dir, 'global.marker');
+    const runMarker = join(dir, 'run.marker');
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        dialTimeoutSecs: 10,
+        cleanup: `echo global > ${globalMarker}`,
+      },
+    });
+    live.push({ env, fake });
+    const { handle } = await env.prepare({
+      spec: { kind: 'railway', metadata: { cleanup: `echo perrun > ${runMarker}` } },
+    });
+    await env.teardown(handle);
+    expect(readFileSync(runMarker, 'utf8').trim()).toBe('perrun');
+    expect(existsSync(globalMarker)).toBe(false);
+  });
+
   it('rolls back (delete + release) when the container never dials home', async () => {
     const { env, fake } = await makeEnv();
     fake.bootBridge = false;
@@ -585,6 +707,110 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const removed = await env.gcOrphans({ allInstances: true });
     expect(removed).toEqual(['svc-crashed-instance']);
     expect(fake.deleted.map((d) => d.serviceId)).not.toContain('svc-live');
+  });
+
+  it('list reports nodes with state + a state-based orphan flag', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [
+      { id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null },
+      { id: 'svc-dead', name: `${SERVICE_NAME_PREFIX}bbb`, status: 'FAILED', createdAt: null },
+    ];
+    const nodes = await env.listNodes();
+    expect(nodes.map((n) => [n.id, n.state, n.orphan])).toEqual([
+      ['svc-ok', 'SUCCESS', false],
+      ['svc-dead', 'FAILED', true],
+    ]);
+  });
+
+  it('get returns one node by id or name, else null', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [{ id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null }];
+    expect((await env.getNode('svc-ok'))?.id).toBe('svc-ok');
+    expect((await env.getNode(`${SERVICE_NAME_PREFIX}aaa`))?.id).toBe('svc-ok');
+    expect(await env.getNode('nope')).toBeNull();
+  });
+
+  it('teardownNode deletes by id or name and is idempotent', async () => {
+    const { env, fake } = await makeEnv();
+    fake.listed = [{ id: 'svc-1', name: `${SERVICE_NAME_PREFIX}aaa` }];
+    expect(await env.teardownNode('svc-1')).toEqual(['svc-1']);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
+    expect(await env.teardownNode('unknown-id')).toEqual([]); // no match -> no-op
+    expect(await env.teardownNode(`${SERVICE_NAME_PREFIX}aaa`)).toEqual(['svc-1']); // by name too
+  });
+
+  it('reap (default) deletes ONLY dead-state nodes, sparing healthy ones', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [
+      { id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null },
+      { id: 'svc-fail', name: `${SERVICE_NAME_PREFIX}bbb`, status: 'FAILED', createdAt: null },
+      { id: 'svc-crash', name: `${SERVICE_NAME_PREFIX}ccc`, status: 'CRASHED', createdAt: null },
+    ];
+    const res = await env.reap();
+    expect(res.deleted.sort()).toEqual(['svc-crash', 'svc-fail']);
+    expect(res.kept.map((n) => n.id)).toEqual(['svc-ok']);
+    expect(fake.deleted.map((d) => d.serviceId).sort()).toEqual(['svc-crash', 'svc-fail']);
+  });
+
+  it('reap dry_run reports the plan without deleting anything', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [{ id: 'svc-fail', name: `${SERVICE_NAME_PREFIX}bbb`, status: 'FAILED', createdAt: null }];
+    const res = await env.reap({ dryRun: true });
+    expect(res.deleted).toEqual(['svc-fail']);
+    expect(res.dryRun).toBe(true);
+    expect(fake.deleted).toEqual([]);
+  });
+
+  it('reap spares healthy orphans unless all+force (the empty-liveness guard)', async () => {
+    const { env, fake } = await makeEnv();
+    fake.detailed = [{ id: 'svc-ok', name: `${SERVICE_NAME_PREFIX}aaa`, status: 'SUCCESS', createdAt: null }];
+    expect((await env.reap({ all: true })).deleted).toEqual([]); // all without force: still spared
+    expect((await env.reap({ all: true, force: true })).deleted).toEqual(['svc-ok']); // now reaped
+  });
+
+  it('teardownNode resolves a bare run id to its deterministic service name', async () => {
+    const { env, fake } = await makeEnv();
+    const runId = 'run-teardown-1';
+    const name = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', runId])).digest('hex').slice(0, 12);
+    fake.listed = [
+      { id: 'svc-run', name },
+      { id: 'svc-other', name: `${SERVICE_NAME_PREFIX}unrelated` },
+    ];
+    // A restarted daemon that persisted only the run id can drive teardown by it.
+    expect(await env.teardownNode(runId)).toEqual(['svc-run']);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-run', environmentId: 'env-1' }]);
+    expect(await env.teardownNode('run-not-live')).toEqual([]); // unknown run id -> no-op
+  });
+
+  it('reap owner-known keeps the live node but reaps a non-live healthy node WITHOUT force', async () => {
+    const { env, fake } = await makeEnv();
+    const liveRun = 'run-live';
+    const deadRun = 'run-orphaned';
+    const liveName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', liveRun])).digest('hex').slice(0, 12);
+    const orphanName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', deadRun])).digest('hex').slice(0, 12);
+    const old = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // older than the 300s grace
+    fake.detailed = [
+      { id: 'svc-live', name: liveName, status: 'SUCCESS', createdAt: old },
+      { id: 'svc-orphan', name: orphanName, status: 'SUCCESS', createdAt: old },
+    ];
+    const res = await env.reap({ liveRunIds: [liveRun] }); // no force
+    expect(res.deleted).toEqual(['svc-orphan']);
+    expect(res.kept.map((n) => n.id)).toEqual(['svc-live']);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-orphan', environmentId: 'env-1' }]);
+  });
+
+  it('reap owner-known enforces the grace floor: a mid-prepare (young) node is spared', async () => {
+    const { env, fake } = await makeEnv();
+    const young = new Date(Date.now() - 5 * 1000).toISOString(); // 5s old — under the 300s grace
+    fake.detailed = [
+      { id: 'svc-young', name: `${SERVICE_NAME_PREFIX}young`, status: 'SUCCESS', createdAt: young },
+    ];
+    // Empty live set => every healthy node is unowned, but the grace floor still
+    // protects a node that may be mid-`prepare` (created before it was leased).
+    const res = await env.reap({ liveRunIds: [] });
+    expect(res.deleted).toEqual([]);
+    expect(res.kept.map((n) => n.id)).toEqual(['svc-young']);
+    expect(fake.deleted).toEqual([]);
   });
 
   it('health degrades (not fails) on missing per-run-suppliable config', async () => {

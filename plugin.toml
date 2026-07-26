@@ -1,6 +1,6 @@
 schema = "animus.plugin.v1"
 name = "animus-environment-railway"
-version = "0.4.0"
+version = "0.4.17"
 plugin_kind = "environment"
 description = "Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image via the Railway GraphQL API, relays harness commands over an outbound WebSocket the container dials home (animus-env-transport), and deletes the service on teardown."
 
@@ -8,12 +8,17 @@ description = "Railway ephemeral-container execution-environment plugin for Anim
 streaming = true
 progress = false
 cancellation = false
-# The `environment` role's three-call contract plus the streaming exec variant.
+# The `environment` role's core contract + the streaming exec variant + the
+# node-management surface (list/get/teardown_node/reap).
 methods = [
   "environment/prepare",
   "environment/exec",
   "environment/exec_stream",
   "environment/teardown",
+  "environment/list",
+  "environment/get",
+  "environment/teardown_node",
+  "environment/reap",
   "health/check",
 ]
 
@@ -61,6 +66,11 @@ description = "Bound on how long prepare waits for the container to dial home (d
 required = false
 
 [[env]]
+key = "ANIMUS_ENV_CLEANUP"
+description = "Default cleanup script (sh -c) run in every node right before teardown, to flush uncommitted work to its branch (e.g. `git add -A && git commit -m checkpoint && git push origin HEAD || true`). Best-effort + bounded; a per-run spec.metadata.cleanup overrides it."
+required = false
+
+[[env]]
 key = "BASE_DB_URL"
 description = "When set on the daemon host, passed through into every run container (shared cloud database endpoint)."
 required = false
@@ -68,6 +78,23 @@ required = false
 [[env]]
 key = "CLAUDE_CONFIG_DIR"
 description = "Daemon-side dir with the Claude subscription .credentials.json; base64-injected into each node so the claude harness runs on the subscription."
+required = false
+
+[[env]]
+key = "ANTHROPIC_AUTH_TOKEN"
+description = "Anthropic-compatible bearer token passed to run nodes as the fallback when the shared Claude subscription credential is missing, expired, or invalid."
+required = false
+sensitive = true
+
+[[env]]
+key = "ANTHROPIC_API_KEY"
+description = "Anthropic API key passed to run nodes as an optional fallback when the shared Claude subscription credential is unavailable."
+required = false
+sensitive = true
+
+[[env]]
+key = "ANTHROPIC_BASE_URL"
+description = "Anthropic-compatible API base URL passed to run nodes with ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY."
 required = false
 
 [[env]]

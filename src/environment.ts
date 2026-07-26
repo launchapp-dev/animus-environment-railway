@@ -18,6 +18,7 @@ import {
   planWorkspace,
   provisionAnimus,
   type EnvironmentHandle,
+  type EnvironmentNodeDescriptor,
   type ExecResponse,
   type HarnessCommand,
   type HealthReport,
@@ -44,7 +45,8 @@ type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | '
   waitForConnection(handleId: string, timeoutMs: number): Promise<unknown>;
 };
 
-import { RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+import { DEAD_DEPLOYMENT_STATES, RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+import { makeCredentialsServicer } from './credentials-servicer.js';
 
 // Short, Railway-valid id token: `<prefix><6 hex>`. The service name is
 // `animus-run-<instanceId>-<id>`, and Railway rejects long service names
@@ -86,6 +88,16 @@ export const WORKSPACE_ROOT = '/workspace';
  *  image does not ship it yet — see INTEGRATION.md. */
 export const DEFAULT_BRIDGE_COMMAND = 'animus-env-bridge';
 
+/** Bound on the pre-teardown cleanup hook (e.g. git commit+push) so a slow or
+ *  hung cleanup can never block node teardown (TASK-809). */
+export const CLEANUP_TIMEOUT_SECS = 120;
+
+/** Owner-known reap grace floor: a node younger than this may be mid-`prepare`
+ *  (the service exists before the daemon has leased/recorded the run), so it is
+ *  never a reap candidate even when it maps to no live run id. Matches the dial
+ *  timeout default. */
+export const REAP_LEAKED_GRACE_SECS = 300;
+
 /** Default parent-side log-storage plugin a node's `log_storage/*` backend/call
  *  is serviced against (its install path in the portal image). */
 export const DEFAULT_UPSTREAM_LOG_BIN = '/app/.animus/plugins/animus-log-storage-s3';
@@ -100,6 +112,15 @@ const LOG_S3_ENV_KEYS = [
   'S3_REGION',
   'S3_PREFIX',
   'S3_FORCE_PATH_STYLE',
+] as const;
+
+/** Anthropic API credentials exposed by the daemon as a fallback when the
+ * shared Claude subscription session cannot be materialized in a run node.
+ * These values are daemon-authoritative and therefore override spec.env. */
+const ANTHROPIC_FALLBACK_ENV_KEYS = [
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_BASE_URL',
 ] as const;
 
 /** Collect the parent's S3 env (non-empty values only) to forward into the
@@ -128,6 +149,11 @@ export interface RailwayHandleMeta {
    *  cold-delete by deterministic name when a caller only has the run id (e.g.
    *  the daemon persisted the run id but crashed before recording service_id). */
   animus_run_id?: string | null;
+  /** Workflow-declared cleanup script (TASK-809): a `sh -c` command run IN the
+   *  node right before it is destroyed, to flush uncommitted work to its branch
+   *  (e.g. `git add -A && git commit -m checkpoint && git push`). Sourced from
+   *  `spec.metadata.cleanup`; absent for workflows that declare no cleanup. */
+  cleanup?: string | null;
 }
 
 export interface RailwayEnvironmentConfig {
@@ -170,6 +196,11 @@ export interface RailwayEnvironmentConfig {
   upstreamLogBin?: string;
   /** Extra TLS material for an in-process WSS listener. */
   tls?: RelayServerOptions['tls'];
+  /** Default cleanup script (TASK-809): a `sh -c` command run IN every node
+   *  right before teardown, to flush uncommitted work (e.g.
+   *  `git add -A && git commit && git push`). Sourced from `ANIMUS_ENV_CLEANUP`;
+   *  a per-run `spec.metadata.cleanup` overrides it. */
+  cleanup?: string;
 }
 
 /** Read the config from the process env (the plugin's runtime posture). */
@@ -177,6 +208,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
   return {
     projectId: env.RAILWAY_PROJECT_ID,
     environmentId: env.RAILWAY_ENVIRONMENT_ID,
+    cleanup: env.ANIMUS_ENV_CLEANUP,
     relayPublicUrl: env.ANIMUS_ENV_RELAY_PUBLIC_URL,
     relayPort: env.ANIMUS_ENV_RELAY_PORT ? Number(env.ANIMUS_ENV_RELAY_PORT) : undefined,
     bridgeCommand: env.ANIMUS_ENV_BRIDGE_COMMAND,
@@ -293,8 +325,8 @@ export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string
  *  it refreshes `.credentials.json` in place when the access token is near expiry
  *  (writing the rotated token back), then injects only a short-lived access token
  *  with the refresh token STRIPPED. The node uses that access token directly and
- *  cannot rotate anything. Best-effort: returns {} when there is no login or the
- *  refresh fails (the node then just has no claude auth). */
+ *  cannot rotate anything. Best-effort: returns {} when there is no usable
+ *  login or refresh fails, allowing the node to use its Anthropic API fallback. */
 export async function claudeNodeCredentials(
   hostEnv: NodeJS.ProcessEnv,
   now: number,
@@ -309,15 +341,26 @@ export async function claudeNodeCredentials(
     file = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
     oauth = (file.claudeAiOauth as Record<string, unknown>) ?? file;
   } catch {
+    process.stderr.write(
+      '[animus-environment-railway] claude credential file is unreadable or invalid; using Anthropic API fallback if configured\n',
+    );
     return {};
   }
   const expiresAt = Number(oauth.expiresAt ?? oauth.expires_at ?? 0);
-  const refreshToken = (oauth.refreshToken ?? oauth.refresh_token) as string | undefined;
-  if (expiresAt && expiresAt - now > CLAUDE_REFRESH_SKEW_MS) {
+  const accessTokenValue = oauth.accessToken ?? oauth.access_token;
+  const refreshTokenValue = oauth.refreshToken ?? oauth.refresh_token;
+  const accessToken = typeof accessTokenValue === 'string' ? accessTokenValue.trim() : '';
+  const refreshToken = typeof refreshTokenValue === 'string' ? refreshTokenValue.trim() : '';
+  if (accessToken && expiresAt && expiresAt - now > CLAUDE_REFRESH_SKEW_MS) {
     // Access token still valid: inject it as-is, minus the refresh token.
     return { ANIMUS_NODE_CLAUDE_CREDENTIALS_B64: encodeNodeClaudeCreds(file, oauth) };
   }
-  if (!refreshToken) return {};
+  if (!refreshToken) {
+    process.stderr.write(
+      '[animus-environment-railway] claude subscription credential has no usable access or refresh token; using Anthropic API fallback if configured\n',
+    );
+    return {};
+  }
   try {
     const res = await fetchImpl(CLAUDE_OAUTH_TOKEN_URL, {
       method: 'POST',
@@ -330,7 +373,13 @@ export async function claudeNodeCredentials(
       );
       return {};
     }
-    const t = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number };
+    const t = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+    if (typeof t.access_token !== 'string' || t.access_token.trim() === '') {
+      process.stderr.write(
+        '[animus-environment-railway] claude token refresh returned no access token; using Anthropic API fallback if configured\n',
+      );
+      return {};
+    }
     const newExpiry = now + Number(t.expires_in ?? 28800) * 1000;
     const refreshed = { ...oauth, accessToken: t.access_token, refreshToken: t.refresh_token ?? refreshToken, expiresAt: newExpiry };
     // Write the rotated token back to the daemon so it (and the next run) stay valid.
@@ -366,6 +415,12 @@ export function runVariables(args: {
   // shared database endpoint the daemon itself uses.
   if (hostEnv.BASE_DB_URL) vars.BASE_DB_URL = hostEnv.BASE_DB_URL;
   Object.assign(vars, args.specEnv ?? {});
+  // The daemon's API fallback wins over spec.env so a dispatched task cannot
+  // replace the configured provider endpoint or credential on its own node.
+  for (const key of ANTHROPIC_FALLBACK_ENV_KEYS) {
+    const value = hostEnv[key];
+    if (value !== undefined && value !== '') vars[key] = value;
+  }
   // Subscription creds + GitHub token win over spec env (they are the daemon's
   // authoritative harness auth, base64'd for the run-image bootstrap).
   Object.assign(vars, harnessCredentialVars(hostEnv));
@@ -383,8 +438,9 @@ export function parseGithubSlug(url: string | undefined): { owner: string; repo:
   return m && m[1] && m[2] ? { owner: m[1], repo: m[2] } : null;
 }
 
-/** Sign a short-lived (<=10 min) GitHub App JWT (RS256) with the app private key. */
-function githubAppJwt(appId: string, privateKeyPem: string, now: number): string {
+/** Sign a short-lived (<=10 min) GitHub App JWT (RS256) with the app private key.
+ *  Exported for the credentials servicer (on-demand re-minting for nodes). */
+export function githubAppJwt(appId: string, privateKeyPem: string, now: number): string {
   const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
   const data = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({ iat: now - 60, exp: now + 540, iss: appId })}`;
   const sig = createSign('RSA-SHA256').update(data).sign(privateKeyPem, 'base64url');
@@ -601,13 +657,20 @@ export class RailwayEnvironment {
       // passthrough): log_storage/* → the parent's log-storage-s3 (same bucket as
       // the daemon), everything else → animus-postgres. Omitted → reverse RPC
       // stays unwired and nodes fall back to their own local backends.
+      // The `credentials` role serves on-demand GitHub token re-mints for the
+      // node's git credential helper (TASK-855) — installation-wide scope, App
+      // private key never crosses the relay. Wired alongside the backend
+      // passthrough only (an unwired reverse RPC keeps its existing semantics:
+      // nodes fall back to their own local backends).
       this.relayInstance = await RelayClient.connect({
         socketPath: this.config.relaySocketPath,
         ...(backend
           ? {
-              onReverseRpc: makeBackendCallHandler(
-                logBackend ? { default: backend, log_storage: logBackend } : backend,
-              ),
+              onReverseRpc: makeBackendCallHandler({
+                default: backend,
+                ...(logBackend ? { log_storage: logBackend } : {}),
+                credentials: makeCredentialsServicer(process.env),
+              }),
             }
           : {}),
       });
@@ -725,6 +788,15 @@ export class RailwayEnvironment {
       throw err;
     }
 
+    const specMeta = (spec.metadata ?? {}) as Record<string, unknown>;
+    // Per-run `spec.metadata.cleanup` overrides the global `ANIMUS_ENV_CLEANUP`
+    // default; either yields a `sh -c` script run in-node just before teardown.
+    const cleanup =
+      typeof specMeta.cleanup === 'string' && specMeta.cleanup.trim().length > 0
+        ? specMeta.cleanup.trim()
+        : this.config.cleanup && this.config.cleanup.trim().length > 0
+          ? this.config.cleanup.trim()
+          : null;
     const metadata: RailwayHandleMeta = {
       service_id: serviceId,
       service_name: serviceName,
@@ -734,6 +806,7 @@ export class RailwayEnvironment {
       image,
       primary_subdir: plan.primarySubdir,
       animus_run_id: runId,
+      cleanup,
     };
     return { handle: { id, workspace_root: WORKSPACE_ROOT, metadata } };
   }
@@ -766,7 +839,12 @@ export class RailwayEnvironment {
    *  remote-animus) and stream its journal events back via `onJournal`. */
   async runSession(
     handle: EnvironmentHandle,
-    params: { subject_id: string; workflow_ref?: string | null; dispatch_input?: string | null; workflow_id?: string | null },
+    params: {
+      subject_id: string;
+      workflow_ref?: string | null;
+      dispatch_input?: string | null;
+      workflow_id?: string | null;
+    },
     onJournal?: (event: JournalEventParams) => void,
   ): Promise<SessionResult> {
     const relay = await this.relay();
@@ -776,8 +854,22 @@ export class RailwayEnvironment {
   /** `teardown`: delete the Railway service and release the relay run.
    *  Idempotent — a missing service or unknown handle is a successful no-op. */
   async teardown(handle: EnvironmentHandle): Promise<void> {
-    if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
     const meta = handle.metadata as RailwayHandleMeta | undefined;
+    // Pre-teardown cleanup hook (TASK-809): run a workflow-declared command IN the
+    // node (e.g. `git add -A && git commit && git push`) to flush uncommitted work
+    // to its branch BEFORE the node is destroyed. Best-effort + bounded, attempted
+    // only while this instance's relay is still connected (graceful teardown); a
+    // failed/slow cleanup never blocks teardown, and a crashed node is covered by
+    // incremental pushes during the run.
+    const cleanup = meta?.cleanup?.trim() || this.config.cleanup?.trim();
+    if (cleanup && this.relayInstance) {
+      try {
+        await this.execCommand(handle, { program: 'sh', args: ['-c', cleanup] }, null, CLEANUP_TIMEOUT_SECS);
+      } catch {
+        // best-effort: a failed cleanup must not block node teardown
+      }
+    }
+    if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
     const environmentId = meta?.environment_id || this.config.environmentId;
     // Fast path: a full handle carries the service_id; delete it directly.
     if (meta?.service_id) {
@@ -828,6 +920,133 @@ export class RailwayEnvironment {
       removed.push(svc.id);
     }
     return removed;
+  }
+
+  /** Node-management (`environment/list`): describe every `animus-run-*` service
+   *  in the project with its latest-deployment state. `orphan` is state-based
+   *  (a dead deployment is always a reap candidate). */
+  async listNodes(): Promise<EnvironmentNodeDescriptor[]> {
+    const projectId = this.config.projectId;
+    if (!projectId) throw new Error('list needs a project id (RAILWAY_PROJECT_ID)');
+    return this.describeNodes(projectId);
+  }
+
+  /** Node-management (`environment/get`): one node by service id or name. */
+  async getNode(idOrName: string): Promise<EnvironmentNodeDescriptor | null> {
+    const nodes = await this.listNodes();
+    return nodes.find((n) => n.id === idOrName || n.name === idOrName) ?? null;
+  }
+
+  /** Node-management (`environment/teardown_node`): delete one service by id or
+   *  name. Idempotent — an unknown/already-gone node returns `[]`. */
+  async teardownNode(idOrName: string): Promise<string[]> {
+    const projectId = this.config.projectId;
+    const environmentId = this.config.environmentId;
+    if (!projectId) throw new Error('teardown needs a project id (RAILWAY_PROJECT_ID)');
+    if (!environmentId) throw new Error('teardown needs an environment id (RAILWAY_ENVIRONMENT_ID)');
+    // Restart-recoverable teardown: accept a substrate service id, a literal
+    // service name, OR a bare animus run id — resolving the run id to its
+    // deterministic service name so a daemon that persisted only the run id can
+    // drive teardown after losing the in-memory handle (TASK-797/TASK-933).
+    const byRunName = deterministicServiceName(projectId, idOrName);
+    const match = (await this.railway().listRunServices(projectId)).find(
+      (s) => s.id === idOrName || s.name === idOrName || s.name === byRunName,
+    );
+    if (!match) return [];
+    await this.railway().deleteService(match.id, environmentId);
+    return [match.id];
+  }
+
+  /** Node-management (`environment/reap`): delete orphaned/dead nodes.
+   *
+   *  Default (no opts): reap ONLY services whose latest deployment is dead
+   *  (FAILED/CRASHED/REMOVED) — always safe, since a healthy live node is never
+   *  in a dead state. `all` additionally reaps non-dead services that have no
+   *  live owning run, but ONLY with `force` (a fresh, non-resident process has
+   *  no in-memory liveness, so it must not assume every healthy node is an
+   *  orphan). `dry_run` reports the plan without deleting.
+   *
+   *  Owner-known mode: when `liveRunIds` (the daemon's authoritative set of live
+   *  run ids) is supplied, a healthy node whose name maps to NO live run id is a
+   *  leak and is reaped WITHOUT `force` — with a mandatory {@link
+   *  REAP_LEAKED_GRACE_SECS} floor so an in-flight `prepare` is never reaped. */
+  async reap(
+    opts: {
+      all?: boolean;
+      force?: boolean;
+      dryRun?: boolean;
+      olderThanSecs?: number;
+      /** Daemon's authoritative live-run set. Present => owner-known mode:
+       *  healthy nodes mapping to no live run id are reaped WITHOUT `force`. */
+      liveRunIds?: string[];
+    } = {},
+  ): Promise<{ deleted: string[]; kept: EnvironmentNodeDescriptor[]; dryRun: boolean }> {
+    const projectId = this.config.projectId;
+    const environmentId = this.config.environmentId;
+    if (!projectId) throw new Error('reap needs a project id (RAILWAY_PROJECT_ID)');
+    if (!environmentId) throw new Error('reap needs an environment id (RAILWAY_ENVIRONMENT_ID)');
+    const nodes = await this.describeNodes(projectId);
+    // Protected set = names of runs KNOWN to be live. Two authoritative sources,
+    // unioned: (1) this process's in-memory relay registrations (only meaningful
+    // in the resident daemon), and (2) the daemon-supplied live run ids mapped to
+    // their deterministic service names (works from a fresh CLI process too).
+    const liveNames = new Set(
+      (this.relayInstance?.registeredRuns() ?? []).map((h) => `${this.instancePrefix()}${h}`),
+    );
+    const ownerKnown = opts.liveRunIds !== undefined;
+    for (const rid of opts.liveRunIds ?? []) liveNames.add(deterministicServiceName(projectId, rid));
+    // In owner-known mode enforce a grace floor so a mid-prepare node (created
+    // before the daemon leased its run) is never reaped out from under itself.
+    const graceSecs = ownerKnown
+      ? Math.max(opts.olderThanSecs ?? 0, REAP_LEAKED_GRACE_SECS)
+      : opts.olderThanSecs;
+    const now = Date.now();
+    const deleted: string[] = [];
+    const kept: EnvironmentNodeDescriptor[] = [];
+    for (const node of nodes) {
+      const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
+      const live = liveNames.has(node.name);
+      const oldEnough =
+        graceSecs === undefined ||
+        (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= graceSecs : true);
+      let reapIt = false;
+      if (dead && oldEnough) reapIt = true;
+      // Owner-known: a healthy node mapping to no live run id is a leak — reap it
+      // WITHOUT `force` (the daemon's live set is authoritative). Legacy path
+      // (no live set supplied) keeps the `all`+`force` empty-liveness guard.
+      else if (!live && oldEnough && (ownerKnown || (opts.all && opts.force))) reapIt = true;
+      if (!reapIt) {
+        kept.push(node);
+        continue;
+      }
+      if (!opts.dryRun) await this.railway().deleteService(node.id, environmentId);
+      deleted.push(node.id);
+    }
+    return { deleted, kept, dryRun: opts.dryRun === true };
+  }
+
+  /** Shared listing used by list/get/reap: prefer the state-aware query, fall
+   *  back to id+name only when the substrate can't report deployment state. */
+  private async describeNodes(projectId: string): Promise<EnvironmentNodeDescriptor[]> {
+    const api = this.railway();
+    let rows: Array<{ id: string; name: string; status?: string | null; createdAt?: string | null }>;
+    if (typeof api.listRunServicesDetailed === 'function') {
+      rows = await api.listRunServicesDetailed(projectId);
+    } else {
+      rows = await api.listRunServices(projectId);
+    }
+    return rows.map((r) => {
+      const state = (r.status ?? 'unknown').toString();
+      return {
+        id: r.id,
+        name: r.name,
+        state,
+        run_id: null,
+        image: null,
+        created_at: r.createdAt ?? null,
+        orphan: DEAD_DEPLOYMENT_STATES.has(state.toUpperCase()),
+      };
+    });
   }
 
   /** Health: surface missing credentials/config before scheduling work. The
