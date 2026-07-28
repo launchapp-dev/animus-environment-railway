@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.18',
+  version: '0.4.19',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -43,6 +43,30 @@ const plugin = defineEnvironmentPlugin({
         'Stable HMAC secret for restart-safe actor-bound handle metadata. Defaults to RAILWAY_TOKEN when unset.',
       required: false,
       sensitive: true,
+    },
+    {
+      name: 'ANIMUS_ENV_RELAY_BINDING_SECRET',
+      description:
+        'Stable AEAD secret for restart-safe relay credentials sealed into environment handles. Defaults to ANIMUS_ENV_ACTOR_BINDING_SECRET or RAILWAY_TOKEN.',
+      required: false,
+      sensitive: true,
+    },
+    {
+      name: 'ANIMUS_ENV_RELAY_CONTROL_TOKEN',
+      description:
+        '32-byte base64url credential shared with the singleton relay control socket. Required by restart-safe relay builds.',
+      required: true,
+      sensitive: true,
+    },
+    {
+      name: 'ANIMUS_ENV_RELAY_OWNER_ID',
+      description: 'Stable trusted owner identity asserted to the singleton relay (default animus-environment-railway).',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_RELAY_SOCK',
+      description: 'Local unix socket exposed by the singleton relay (default /tmp/animus-env-relay.sock).',
+      required: false,
     },
     {
       name: 'ANIMUS_ENV_RELAY_PUBLIC_URL',

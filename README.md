@@ -9,8 +9,8 @@ Mirrors the shape of
 but Railway has **no inbound exec/attach** — so the local `docker exec`
 primitive is replaced by the
 [`animus-env-transport`](https://github.com/launchapp-dev/animus-env-transport)
-WebSocket relay: the container dials an **outbound** WSS connection home to a
-RelayServer hosted inside this plugin, and every `HarnessCommand` rides that
+WebSocket relay: the container dials an **outbound** WSS connection home to
+the shared `animus-env-relay` singleton, and every `HarnessCommand` rides that
 socket.
 
 ## Flow
@@ -48,6 +48,15 @@ only the SDK-authenticated actor as `ANIMUS_ACTOR_JSON`, signs the persisted
 handle marker for restart-safe reattachment, and enforces the same actor on
 node-originated reverse RPC. `ANIMUS_ENV_ACTOR_BINDING_SECRET` may provide a
 dedicated stable signing key; when omitted, `RAILWAY_TOKEN` is used.
+
+Relay ownership is restart-safe as well. New handles contain an AEAD-sealed
+run token and owner token covered by the actor-binding HMAC. After the Portal,
+daemon, or environment-plugin process restarts, the plugin presents those
+exact credentials to the durable singleton registration and resumes the same
+session ID; it never prepares a second node or workflow. Configure
+`ANIMUS_ENV_RELAY_CONTROL_TOKEN` as a 32-byte base64url credential shared with
+the singleton. `ANIMUS_ENV_RELAY_BINDING_SECRET` should be stable across
+deploys; it defaults to the actor-binding secret or `RAILWAY_TOKEN`.
 
 Claude authentication prefers the shared subscription credential in
 `CLAUDE_CONFIG_DIR`. The daemon refreshes that credential centrally and only
