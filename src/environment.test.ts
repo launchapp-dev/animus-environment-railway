@@ -104,11 +104,22 @@ class FakeRailway implements RailwayApi {
 
 class RecordingRelay implements RelayTransport {
   readonly sessions: Array<{ handleId: string; params: Record<string, unknown> }> = [];
+  readonly attachments: Array<{ handleId: string; token: string; ownerToken: string }> = [];
+  readonly releases: Array<{ handleId: string; token?: string; ownerToken?: string }> = [];
   private readonly handles = new Set<string>();
 
-  registerRun(handleId = 'relay-handle'): { url: string; token: string } {
+  registerRun(handleId = 'relay-handle'): { url: string; token: string; ownerToken: string } {
     this.handles.add(handleId);
-    return { url: `ws://relay/relay/${handleId}`, token: `token-${handleId}` };
+    return { url: `ws://relay/relay/${handleId}`, token: 'T'.repeat(43), ownerToken: 'O'.repeat(43) };
+  }
+
+  async attachRun(
+    handleId: string,
+    credentials: { token: string; ownerToken: string },
+  ): Promise<{ url: string; token: string; ownerToken: string }> {
+    this.attachments.push({ handleId, ...credentials });
+    this.handles.add(handleId);
+    return { url: `ws://relay/relay/${handleId}`, ...credentials };
   }
 
   async waitForConnection(): Promise<void> {}
@@ -125,7 +136,8 @@ class RecordingRelay implements RelayTransport {
     return { workflow_id: typeof params.workflow_id === 'string' ? params.workflow_id : null, status: 'completed' };
   }
 
-  releaseRun(handleId: string): void {
+  releaseRun(handleId: string, credentials?: { token: string; ownerToken: string }): void {
+    this.releases.push({ handleId, ...credentials });
     this.handles.delete(handleId);
   }
 
@@ -1147,6 +1159,100 @@ describe('prepare -> exec_session actor binding', () => {
     await expect(
       wrongSecret.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, alice, alice, true),
     ).rejects.toThrow(/invalid actor binding signature/);
+  });
+
+  it('reattaches a persisted handle to a fresh relay with sealed exact credentials', async () => {
+    const { handle } = await boundEnvironment(alice);
+    const metadata = handle.metadata as Record<string, unknown>;
+    expect(metadata.animus_relay_binding).toEqual(expect.stringMatching(/^v1\./));
+    expect(String(metadata.animus_relay_binding)).not.toContain('T'.repeat(43));
+    expect(String(metadata.animus_relay_binding)).not.toContain('O'.repeat(43));
+
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+
+    await expect(
+      restarted.runSession(
+        handle,
+        { subject_id: 'task:TASK-1', workflow_id: 'wf-restarted' },
+        undefined,
+        alice,
+        alice,
+        true,
+      ),
+    ).resolves.toEqual({ workflow_id: 'wf-restarted', status: 'completed' });
+    expect(relay.attachments).toEqual([{
+      handleId: handle.id,
+      token: 'T'.repeat(43),
+      ownerToken: 'O'.repeat(43),
+    }]);
+    expect(relay.sessions).toHaveLength(1);
+  });
+
+  it('fails closed when a persisted relay binding is tampered', async () => {
+    const { handle } = await boundEnvironment(alice);
+    const metadata = handle.metadata as Record<string, unknown>;
+    const forged = {
+      ...handle,
+      metadata: {
+        ...metadata,
+        animus_relay_binding: `${String(metadata.animus_relay_binding).slice(0, -1)}x`,
+      },
+    };
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+    await expect(
+      restarted.runSession(forged, { subject_id: 'task:TASK-1' }, undefined, alice, alice, true),
+    ).rejects.toThrow(/invalid actor binding signature|could not be authenticated/);
+    expect(relay.attachments).toHaveLength(0);
+  });
+
+  it('tears down from a restarted process using the sealed relay credentials', async () => {
+    const { handle } = await boundEnvironment(alice);
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+
+    await restarted.teardown(handle);
+    expect(relay.attachments).toHaveLength(0);
+    expect(relay.releases).toEqual([{
+      handleId: handle.id,
+      token: 'T'.repeat(43),
+      ownerToken: 'O'.repeat(43),
+    }]);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
   });
 
   it('rejects malformed prepare actors before creating a service', async () => {

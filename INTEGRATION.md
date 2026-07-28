@@ -76,6 +76,9 @@ unchanged — no plugin-side work expected, but verify the runner honors
 - **Secrets**: the per-run relay token is minted daemon-side and injected as
   `ANIMUS_ENV_RUN_TOKEN`; rotate by teardown/prepare. `RAILWAY_TOKEN` belongs
   in the OS keychain via `animus secret set RAILWAY_TOKEN`.
-- **Relay lifetime**: one `RelayServer` per plugin process, shared by runs;
-  handles die with the process, so a plugin restart orphans running services —
-  that is what the GC sweep is for.
+- **Relay lifetime**: the always-on `animus-env-relay` singleton persists
+  hashed registrations under `ANIMUS_ENV_STATE_DIR` while the environment
+  handle persists its AEAD-sealed owner credentials. A restarted plugin
+  reattaches the exact handle and session. Set the same
+  `ANIMUS_ENV_RELAY_CONTROL_TOKEN` in both processes and keep
+  `ANIMUS_ENV_RELAY_BINDING_SECRET` stable across deploys.

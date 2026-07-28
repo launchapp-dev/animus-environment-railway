@@ -11,7 +11,15 @@
 // and the in-container bridge spawns them with `shell: false`. The provision
 // (git clone / animus install) commands assembled here are argv arrays too.
 
-import { createHash, createHmac, createSign, randomBytes, timingSafeEqual } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  createSign,
+  randomBytes,
+  timingSafeEqual,
+} from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import {
@@ -43,10 +51,21 @@ import {
  *  shared singleton (production). `registerRun` may be sync or async — callers
  *  `await` it. */
 export type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | 'registeredRuns' | 'close'> & {
-  registerRun(handleId?: string): { url: string; token: string } | Promise<{ url: string; token: string }>;
+  registerRun(handleId?: string):
+    | { url: string; token: string; ownerToken?: string }
+    | Promise<{ url: string; token: string; ownerToken?: string }>;
+  attachRun?: (
+    handleId: string,
+    credentials: RelayCredentials,
+  ) => Promise<{ url: string; token: string; ownerToken: string }>;
   // RelayServer returns the connection, RelayClient returns void — callers ignore it.
   waitForConnection(handleId: string, timeoutMs: number): Promise<unknown>;
 };
+
+interface RelayCredentials {
+  token: string;
+  ownerToken: string;
+}
 
 import { DEAD_DEPLOYMENT_STATES, RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
 import { makeCredentialsServicer } from './credentials-servicer.js';
@@ -116,19 +135,80 @@ export function validateRawActor(rawActor: unknown, actor: Actor | undefined, pr
 }
 
 function actorBindingMac(secret: string, handle: EnvironmentHandle, metadata: Record<string, unknown>): string {
+  const signed: Record<string, unknown> = {
+    version: 1,
+    handle_id: handle.id,
+    service_id: metadata.service_id,
+    environment_id: metadata.environment_id,
+    scope: metadata.animus_actor_scope,
+    fingerprint: metadata.animus_actor_fingerprint,
+  };
+  // Preserve compatibility with handles signed before durable relay bindings
+  // existed: only new handles include this field in the MAC payload.
+  if (typeof metadata.animus_relay_binding === 'string') {
+    signed.animus_relay_binding = metadata.animus_relay_binding;
+  }
   return createHmac('sha256', secret)
     .update('animus-environment-railway/actor-binding/v1\0')
-    .update(
-      JSON.stringify({
-        version: 1,
-        handle_id: handle.id,
-        service_id: metadata.service_id,
-        environment_id: metadata.environment_id,
-        scope: metadata.animus_actor_scope,
-        fingerprint: metadata.animus_actor_fingerprint,
-      }),
-    )
+    .update(JSON.stringify(signed))
     .digest('hex');
+}
+
+function relayBindingKey(secret: string): Buffer {
+  return createHash('sha256')
+    .update('animus-environment-railway/relay-binding/v1\0')
+    .update(secret)
+    .digest();
+}
+
+function sealRelayBinding(secret: string, handleId: string, credentials: RelayCredentials): string {
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', relayBindingKey(secret), nonce);
+  cipher.setAAD(Buffer.from(handleId, 'utf8'));
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(credentials), 'utf8'),
+    cipher.final(),
+  ]);
+  return [
+    'v1',
+    nonce.toString('base64url'),
+    ciphertext.toString('base64url'),
+    cipher.getAuthTag().toString('base64url'),
+  ].join('.');
+}
+
+function openRelayBinding(secret: string, handle: EnvironmentHandle): RelayCredentials | null {
+  const metadata = handle.metadata as Record<string, unknown> | undefined;
+  const sealed = metadata?.animus_relay_binding;
+  if (sealed === undefined || sealed === null) return null;
+  if (typeof sealed !== 'string') {
+    throw new Error(`environment handle '${handle.id}' has malformed relay binding metadata`);
+  }
+  const [version, nonceRaw, ciphertextRaw, tagRaw, ...extra] = sealed.split('.');
+  if (version !== 'v1' || !nonceRaw || !ciphertextRaw || !tagRaw || extra.length > 0) {
+    throw new Error(`environment handle '${handle.id}' has malformed relay binding metadata`);
+  }
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', relayBindingKey(secret), Buffer.from(nonceRaw, 'base64url'));
+    decipher.setAAD(Buffer.from(handle.id, 'utf8'));
+    decipher.setAuthTag(Buffer.from(tagRaw, 'base64url'));
+    const plaintext = Buffer.concat([
+      decipher.update(Buffer.from(ciphertextRaw, 'base64url')),
+      decipher.final(),
+    ]).toString('utf8');
+    const parsed = JSON.parse(plaintext) as Partial<RelayCredentials>;
+    if (
+      typeof parsed.token !== 'string' ||
+      typeof parsed.ownerToken !== 'string' ||
+      !/^[A-Za-z0-9_-]{43}$/.test(parsed.token) ||
+      !/^[A-Za-z0-9_-]{43}$/.test(parsed.ownerToken)
+    ) {
+      throw new Error('invalid relay credentials');
+    }
+    return { token: parsed.token, ownerToken: parsed.ownerToken };
+  } catch {
+    throw new Error(`environment handle '${handle.id}' relay binding could not be authenticated`);
+  }
 }
 
 function bindingFromHandle(handle: EnvironmentHandle, secret: string): ActorBinding {
@@ -317,6 +397,9 @@ export interface RailwayHandleMeta {
   /** HMAC over the handle identity, substrate target, and actor marker. Makes
    * persisted metadata safe to use for restart reattachment. */
   animus_actor_binding_mac: string;
+  /** AEAD-sealed relay token + owner token. Never contains plaintext bearer
+   * credentials and is covered by `animus_actor_binding_mac`. */
+  animus_relay_binding?: string | null;
 }
 
 export interface RailwayEnvironmentConfig {
@@ -367,6 +450,14 @@ export interface RailwayEnvironmentConfig {
   /** Stable HMAC secret for signed actor-binding metadata. Defaults to the
    * Railway token; configure explicitly to decouple secret rotation. */
   actorBindingSecret?: string;
+  /** Stable AEAD secret for sealed relay credentials in handle metadata.
+   * Defaults to actorBindingSecret/RAILWAY_TOKEN for backwards-compatible
+   * deployments, but should be configured explicitly. */
+  relayBindingSecret?: string;
+  /** Stable trusted control identity asserted to the relay singleton. */
+  relayOwnerId?: string;
+  /** Shared singleton control-plane credential. */
+  relayControlToken?: string;
 }
 
 /** Read the config from the process env (the plugin's runtime posture). */
@@ -388,6 +479,10 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
     upstreamLogBin: env.ANIMUS_ENV_UPSTREAM_LOG_BIN,
     relaySocketPath: env.ANIMUS_ENV_RELAY_SOCK,
     actorBindingSecret: env.ANIMUS_ENV_ACTOR_BINDING_SECRET ?? env.RAILWAY_TOKEN,
+    relayBindingSecret:
+      env.ANIMUS_ENV_RELAY_BINDING_SECRET ?? env.ANIMUS_ENV_ACTOR_BINDING_SECRET ?? env.RAILWAY_TOKEN,
+    relayOwnerId: env.ANIMUS_ENV_RELAY_OWNER_ID,
+    relayControlToken: env.ANIMUS_ENV_RELAY_CONTROL_TOKEN,
   };
 }
 
@@ -756,6 +851,7 @@ export class RailwayEnvironment {
    * to rehydrate this map after a plugin restart, after matching ctx.actor. */
   private readonly actorBindings = new Map<string, ActorBinding>();
   private readonly actorBindingSecret: string;
+  private readonly relayBindingSecret: string;
   /** Random per-process identity baked into service names, so a GC sweep can
    *  distinguish this instance's runs from another live plugin instance's. */
   readonly instanceId: string = shortId('i');
@@ -772,6 +868,7 @@ export class RailwayEnvironment {
     // reattach across restart. Production config derives a stable key from
     // RAILWAY_TOKEN unless ANIMUS_ENV_ACTOR_BINDING_SECRET is explicit.
     this.actorBindingSecret = this.config.actorBindingSecret?.trim() || randomBytes(32).toString('hex');
+    this.relayBindingSecret = this.config.relayBindingSecret?.trim() || this.actorBindingSecret;
   }
 
   /** Lazily spawn the parent-side backend plugin a node's `backend/call` is
@@ -845,6 +942,8 @@ export class RailwayEnvironment {
       // nodes fall back to their own local backends).
       this.relayInstance = await RelayClient.connect({
         socketPath: this.config.relaySocketPath,
+        actorId: this.config.relayOwnerId?.trim() || 'animus-environment-railway',
+        controlToken: this.config.relayControlToken,
         ...(backend
           ? {
               onReverseRpc: makeActorBoundReverseHandler(
@@ -905,10 +1004,11 @@ export class RailwayEnvironment {
     let relay: RelayTransport | undefined;
     let url: string;
     let token: string;
+    let ownerToken: string | undefined;
     let plan: WorkspacePlan;
     try {
       relay = await this.relay();
-      ({ url, token } = await relay.registerRun(id));
+      ({ url, token, ownerToken } = await relay.registerRun(id));
       plan = planWorkspace(spec, WORKSPACE_ROOT);
       // Validate every planned subdir up front (a spec-supplied repo `name` like
       // `../outside` must never escape the workspace root or poison the default
@@ -925,7 +1025,7 @@ export class RailwayEnvironment {
         }
       }
     } catch (err) {
-      relay?.releaseRun(id);
+      if (relay) await Promise.resolve(relay.releaseRun(id)).catch(() => undefined);
       this.actorBindings.delete(id);
       throw err;
     }
@@ -984,7 +1084,7 @@ export class RailwayEnvironment {
       }
     } catch (err) {
       // Roll back the half-prepared run: forget the token, delete the service.
-      relay.releaseRun(id);
+      await Promise.resolve(relay.releaseRun(id)).catch(() => undefined);
       this.actorBindings.delete(id);
       if (serviceId) {
         await this.railway()
@@ -1015,6 +1115,9 @@ export class RailwayEnvironment {
       cleanup,
       animus_actor_scope: binding.scope,
       animus_actor_fingerprint: binding.fingerprint,
+      animus_relay_binding: ownerToken
+        ? sealRelayBinding(this.relayBindingSecret, id, { token, ownerToken })
+        : null,
     };
     const metadata: RailwayHandleMeta = {
       ...unsignedMetadata,
@@ -1082,6 +1185,15 @@ export class RailwayEnvironment {
     const binding = authorizeActor(live ?? persisted, handle.id, actor);
     if (!live) this.actorBindings.set(handle.id, binding);
     const relay = await this.relay();
+    if (!relay.registeredRuns().includes(handle.id)) {
+      const credentials = openRelayBinding(this.relayBindingSecret, handle);
+      if (!credentials || !relay.attachRun) {
+        throw new Error(`environment handle '${handle.id}' cannot reattach to the relay after restart`);
+      }
+      await relay.attachRun(handle.id, credentials);
+      const dialTimeoutMs = (this.config.dialTimeoutSecs ?? 300) * 1000;
+      await relay.waitForConnection(handle.id, dialTimeoutMs);
+    }
     return relay.runSession(handle.id, params, onJournal);
   }
 
@@ -1107,7 +1219,13 @@ export class RailwayEnvironment {
     // credential call). Revoke authority immediately after that bounded hook,
     // before releasing the relay registration or deleting the substrate node.
     this.actorBindings.delete(handle.id);
-    if (this.relayInstance) this.relayInstance.releaseRun(handle.id);
+    const credentials = openRelayBinding(this.relayBindingSecret, handle);
+    if (this.relayInstance?.registeredRuns().includes(handle.id)) {
+      await Promise.resolve(this.relayInstance.releaseRun(handle.id, credentials ?? undefined));
+    } else if (credentials) {
+      const relay = await this.relay();
+      await Promise.resolve(relay.releaseRun(handle.id, credentials));
+    }
     const environmentId = meta?.environment_id || this.config.environmentId;
     // Fast path: a full handle carries the service_id; delete it directly.
     if (meta?.service_id) {
