@@ -40,10 +40,12 @@ import {
   makeBackendCallHandler,
   RelayErrorCode,
   RelayRpcError,
+  ExecutionFenceSchema,
   type RelayServerOptions,
   type ReverseRpcHandler,
   type SessionResult,
   type JournalEventParams,
+  type ExecutionFence,
 } from '@launchapp-dev/animus-env-transport';
 
 /** The relay surface `prepare`/`exec`/`teardown` drive, satisfied by BOTH the
@@ -61,6 +63,37 @@ export type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseR
   // RelayServer returns the connection, RelayClient returns void — callers ignore it.
   waitForConnection(handleId: string, timeoutMs: number): Promise<unknown>;
 };
+
+function validateExecutionFence(
+  params: {
+    subject_id: string;
+    workflow_id?: string | null;
+    execution_fence?: unknown;
+  },
+): ExecutionFence | null {
+  if (params.execution_fence === undefined || params.execution_fence === null) return null;
+  const parsed = ExecutionFenceSchema.safeParse(params.execution_fence);
+  if (!parsed.success) {
+    throw new Error(`environment exec_session execution_fence is invalid: ${parsed.error.message}`);
+  }
+  const fence = parsed.data;
+  if (params.workflow_id !== fence.workflow_id) {
+    throw new Error('environment exec_session workflow_id does not match execution_fence');
+  }
+  const qualifiedSubject = fence.subject?.qualified_id;
+  if (
+    qualifiedSubject &&
+    qualifiedSubject !== params.subject_id &&
+    !qualifiedSubject.endsWith(`:${params.subject_id}`)
+  ) {
+    throw new Error('environment exec_session subject_id does not match execution_fence');
+  }
+  return fence;
+}
+
+function sameExecutionFence(left: ExecutionFence | null | undefined, right: ExecutionFence): boolean {
+  return left !== null && left !== undefined && JSON.stringify(left) === JSON.stringify(right);
+}
 
 interface RelayCredentials {
   token: string;
@@ -1163,6 +1196,7 @@ export class RailwayEnvironment {
       workflow_ref?: string | null;
       dispatch_input?: string | null;
       workflow_id?: string | null;
+      execution_fence?: unknown;
     },
     onJournal?: (event: JournalEventParams) => void,
     actor?: Actor,
@@ -1184,6 +1218,7 @@ export class RailwayEnvironment {
     }
     const binding = authorizeActor(live ?? persisted, handle.id, actor);
     if (!live) this.actorBindings.set(handle.id, binding);
+    const executionFence = validateExecutionFence(params);
     const relay = await this.relay();
     if (!relay.registeredRuns().includes(handle.id)) {
       const credentials = openRelayBinding(this.relayBindingSecret, handle);
@@ -1194,7 +1229,22 @@ export class RailwayEnvironment {
       const dialTimeoutMs = (this.config.dialTimeoutSecs ?? 300) * 1000;
       await relay.waitForConnection(handle.id, dialTimeoutMs);
     }
-    return relay.runSession(handle.id, params, onJournal);
+    const result = await relay.runSession(
+      handle.id,
+      { ...params, execution_fence: executionFence },
+      onJournal,
+    );
+    if (executionFence) {
+      if (result.workflow_id !== executionFence.workflow_id) {
+        throw new Error('environment exec_session response workflow_id does not match execution_fence');
+      }
+      if (!sameExecutionFence(result.execution_fence, executionFence)) {
+        throw new Error('environment exec_session response did not echo the exact execution_fence');
+      }
+    } else if (result.execution_fence !== undefined && result.execution_fence !== null) {
+      throw new Error('environment exec_session response returned an undelegated execution_fence');
+    }
+    return result;
   }
 
   /** `teardown`: delete the Railway service and release the relay run.

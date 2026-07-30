@@ -16,7 +16,7 @@ import { PassThrough } from 'node:stream';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { BridgeClient, RelayServer } from '@launchapp-dev/animus-env-transport';
+import { BridgeClient, RelayServer, type ExecutionFence } from '@launchapp-dev/animus-env-transport';
 import {
   defineEnvironmentPlugin,
   planWorkspace,
@@ -131,9 +131,14 @@ class RecordingRelay implements RelayTransport {
   async runSession(
     handleId: string,
     params: Record<string, unknown>,
-  ): Promise<{ workflow_id: string | null; status: string }> {
+  ): Promise<{ workflow_id: string | null; status: string; execution_fence?: ExecutionFence | null }> {
     this.sessions.push({ handleId, params });
-    return { workflow_id: typeof params.workflow_id === 'string' ? params.workflow_id : null, status: 'completed' };
+    const executionFence = params.execution_fence as ExecutionFence | null | undefined;
+    return {
+      workflow_id: typeof params.workflow_id === 'string' ? params.workflow_id : null,
+      status: 'completed',
+      ...(executionFence ? { execution_fence: executionFence } : {}),
+    };
   }
 
   releaseRun(handleId: string, credentials?: { token: string; ownerToken: string }): void {
@@ -1023,6 +1028,24 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
 describe('prepare -> exec_session actor binding', () => {
   const alice = { user_id: 'alice', claims: ['admin'], tenant_id: 'acme' };
   const bob = { user_id: 'bob', claims: [], tenant_id: 'acme' };
+  const executionFence: ExecutionFence = {
+    schema: 'animus.execution-fence.v1',
+    version: 1,
+    workflow_id: 'wf-1',
+    workflow_generation: 2,
+    subject: { qualified_id: 'task:TASK-1', generation: 3 },
+    queue_lease: {
+      entry_id: 'queue-1',
+      owner_id: 'daemon-1',
+      generation: 4,
+      expires_at: '2026-07-30T09:00:00Z',
+    },
+    repository: {
+      repository: 'launchapp-dev/example',
+      base_ref: 'refs/heads/main',
+      head_ref: 'refs/heads/animus/TASK-1',
+    },
+  };
 
   async function boundEnvironment(actor?: typeof alice, specActor = actor): Promise<{
     env: RailwayEnvironment;
@@ -1080,6 +1103,58 @@ describe('prepare -> exec_session actor binding', () => {
       ),
     ).resolves.toEqual({ workflow_id: 'wf-1', status: 'completed' });
     expect(relay.sessions).toHaveLength(1);
+  });
+
+  it('forwards and verifies the exact execution fence before accepting terminal state', async () => {
+    const { env, relay, handle } = await boundEnvironment(alice);
+    await expect(
+      env.runSession(
+        handle,
+        { subject_id: 'task:TASK-1', workflow_id: 'wf-1', execution_fence: executionFence },
+        undefined,
+        alice,
+        alice,
+        true,
+      ),
+    ).resolves.toEqual({ workflow_id: 'wf-1', status: 'completed', execution_fence: executionFence });
+    expect(relay.sessions[0]?.params.execution_fence).toEqual(executionFence);
+
+    await expect(
+      env.runSession(
+        handle,
+        { subject_id: 'task:TASK-1', workflow_id: 'wf-stale', execution_fence: executionFence },
+        undefined,
+        alice,
+        alice,
+        true,
+      ),
+    ).rejects.toThrow(/workflow_id does not match/);
+    await expect(
+      env.runSession(
+        handle,
+        { subject_id: 'task:TASK-2', workflow_id: 'wf-1', execution_fence: executionFence },
+        undefined,
+        alice,
+        alice,
+        true,
+      ),
+    ).rejects.toThrow(/subject_id does not match/);
+
+    relay.runSession = async () => ({
+      workflow_id: 'wf-1',
+      status: 'completed',
+      execution_fence: { ...executionFence, workflow_generation: executionFence.workflow_generation + 1 },
+    });
+    await expect(
+      env.runSession(
+        handle,
+        { subject_id: 'task:TASK-1', workflow_id: 'wf-1', execution_fence: executionFence },
+        undefined,
+        alice,
+        alice,
+        true,
+      ),
+    ).rejects.toThrow(/did not echo the exact execution_fence/);
   });
 
   it('rejects omitted, mismatched, and malformed actors for an actor-bound handle', async () => {

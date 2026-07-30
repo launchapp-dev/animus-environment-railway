@@ -113,6 +113,12 @@ plugin family — none are on npm yet. That is a build-time concern only: the
 the release asset carries no `file:../` references. Building from source needs
 those siblings checked out flat next to this repo.
 
+The bundle is deliberately fail-closed on the transport boundary: this source
+release pins `@launchapp-dev/animus-env-transport` to the immutable `v0.3.2` Git
+tag and rejects any different installed package version before writing release
+assets. Private-repository builders must have GitHub read access when running
+`npm ci`; the published environment binary remains self-contained.
+
 ## Develop
 
 ```bash

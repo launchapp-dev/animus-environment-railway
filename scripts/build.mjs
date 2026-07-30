@@ -1,11 +1,23 @@
 import { build } from 'esbuild';
-import { chmodSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const outfile = join(root, 'dist', 'animus-environment-railway');
+const expectedTransportVersion = '0.3.2';
+const transportPackage = JSON.parse(
+  readFileSync(
+    join(root, 'node_modules', '@launchapp-dev', 'animus-env-transport', 'package.json'),
+    'utf8',
+  ),
+);
+if (transportPackage.version !== expectedTransportVersion) {
+  throw new Error(
+    `refusing to bundle animus-environment-railway with animus-env-transport ${String(transportPackage.version)}; expected ${expectedTransportVersion}`,
+  );
+}
 
 mkdirSync(join(root, 'dist'), { recursive: true });
 
