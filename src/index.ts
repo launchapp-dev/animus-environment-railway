@@ -213,6 +213,7 @@ const plugin = defineEnvironmentPlugin({
         workflow_ref: params.workflow_ref,
         dispatch_input: params.dispatch_input,
         workflow_id: params.workflow_id,
+        execution_fence: (params as Record<string, unknown>).execution_fence,
       },
       (ev) =>
         emit({
@@ -230,7 +231,11 @@ const plugin = defineEnvironmentPlugin({
       (params as Record<string, unknown>).actor,
       Object.prototype.hasOwnProperty.call(params, 'actor'),
     );
-    return { workflow_id: result.workflow_id, status: result.status };
+    return {
+      workflow_id: result.workflow_id,
+      status: result.status,
+      execution_fence: result.execution_fence ?? null,
+    };
   },
 
   teardown: async (params) => {
