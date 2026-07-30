@@ -7,6 +7,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const outfile = join(root, 'dist', 'animus-environment-railway');
 const expectedTransportVersion = '0.3.2';
+const expectedEnvironmentBaseCommit = '56a370a2bf622ef009e90f2004353b89f8a7ad4c';
 const transportPackage = JSON.parse(
   readFileSync(
     join(root, 'node_modules', '@launchapp-dev', 'animus-env-transport', 'package.json'),
@@ -16,6 +17,17 @@ const transportPackage = JSON.parse(
 if (transportPackage.version !== expectedTransportVersion) {
   throw new Error(
     `refusing to bundle animus-environment-railway with animus-env-transport ${String(transportPackage.version)}; expected ${expectedTransportVersion}`,
+  );
+}
+
+const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
+const environmentBaseLock = lock.packages?.['node_modules/@launchapp-dev/animus-environment-base'];
+if (
+  typeof environmentBaseLock?.resolved !== 'string' ||
+  !environmentBaseLock.resolved.endsWith(`#${expectedEnvironmentBaseCommit}`)
+) {
+  throw new Error(
+    `refusing to bundle animus-environment-railway without animus-environment-base commit ${expectedEnvironmentBaseCommit}`,
   );
 }
 

@@ -106,12 +106,11 @@ assets look right; it does not cut the release itself.
 
 ## Publishing note
 
-Dependencies on `animus-environment-base` / `animus-env-transport` (and,
-transitively, the SDK) are `file:../` siblings, matching the rest of the TS
-plugin family — none are on npm yet. That is a build-time concern only: the
-`npm run bundle` esbuild step inlines them into the single published binary, so
-the release asset carries no `file:../` references. Building from source needs
-those siblings checked out flat next to this repo.
+Dependencies on `animus-environment-base` and `animus-env-transport` are pinned
+to immutable Git revisions. Both dependency trees build themselves during Git
+installation, so a clean checkout needs no mutable sibling worktrees. The
+`npm run bundle` esbuild step still inlines them into the single published
+binary, and the release asset carries no Git or `file:../` dependency.
 
 The bundle is deliberately fail-closed on the transport boundary: this source
 release pins `@launchapp-dev/animus-env-transport` to the immutable `v0.3.2` Git
