@@ -569,9 +569,11 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
         ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
         : undefined,
     capacityLockRoot: env.ANIMUS_ENV_CAPACITY_LOCK_DIR,
-    capacityConfirmationTimeoutMs: env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS
-      ? Number(env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS)
-      : undefined,
+    capacityConfirmationTimeoutMs:
+      env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS !== undefined &&
+      env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS.trim() !== ''
+        ? Number(env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS)
+        : undefined,
   };
 }
 

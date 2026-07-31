@@ -737,6 +737,10 @@ describe('pure helpers', () => {
       configFromEnv({ ANIMUS_ENV_MAX_MANAGED_NODES: '   ' } as NodeJS.ProcessEnv).maxManagedNodes,
     ).toBeUndefined();
     expect(
+      configFromEnv({ ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS: '   ' } as NodeJS.ProcessEnv)
+        .capacityConfirmationTimeoutMs,
+    ).toBeUndefined();
+    expect(
       configFromEnv({ ANIMUS_ENV_MAX_MANAGED_NODES: '0' } as NodeJS.ProcessEnv).maxManagedNodes,
     ).toBe(0);
     expect(configFromEnv({ RAILWAY_TOKEN: 'railway-secret' } as NodeJS.ProcessEnv).actorBindingSecret).toBe(
