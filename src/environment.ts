@@ -1106,8 +1106,14 @@ export class RailwayEnvironment {
       releaseFileLock = await this.acquireCapacityLock(scope);
       return await operation();
     } finally {
-      await releaseFileLock?.();
-      release();
+      // Always advance the in-process queue, even if releasing the
+      // cross-process lock fails. Otherwise one cleanup error permanently
+      // strands every later prepare behind an unresolved admissionTail.
+      try {
+        await releaseFileLock?.();
+      } finally {
+        release();
+      }
     }
   }
 
