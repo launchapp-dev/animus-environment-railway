@@ -29,7 +29,7 @@
     "release": "node scripts/release.mjs"
   },
   "dependencies": {
-    "@launchapp-dev/animus-env-transport": "github:launchapp-dev/animus-env-transport#v0.3.2",
+    "@launchapp-dev/animus-env-transport": "github:launchapp-dev/animus-env-transport#v0.3.3",
     "@launchapp-dev/animus-environment-base": "github:launchapp-dev/animus-environment-base#56a370a2bf622ef009e90f2004353b89f8a7ad4c"
   },
   "devDependencies": {

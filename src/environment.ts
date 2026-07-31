@@ -48,6 +48,11 @@ import {
   type ExecutionFence,
 } from '@launchapp-dev/animus-env-transport';
 
+import {
+  makeScopedBackendCallAuthorizer,
+  type BackendCallScope,
+} from './backend-call-policy.js';
+
 /** The relay surface `prepare`/`exec`/`teardown` drive, satisfied by BOTH the
  *  in-process `RelayServer` (tests) and the `RelayClient` that talks to the
  *  shared singleton (production). `registerRun` may be sync or async — callers
@@ -181,6 +186,13 @@ function actorBindingMac(secret: string, handle: EnvironmentHandle, metadata: Re
   if (typeof metadata.animus_relay_binding === 'string') {
     signed.animus_relay_binding = metadata.animus_relay_binding;
   }
+  // New handles bind every reverse-backend scope carrier into the same trusted
+  // MAC as the actor and relay credentials. Older handles omit these keys and
+  // retain their legacy signature; they are re-scoped from trusted
+  // environment/exec_session params before any row call is allowed.
+  for (const key of ['animus_run_id', 'animus_github_owner', 'animus_github_repo'] as const) {
+    if (typeof metadata[key] === 'string') signed[key] = metadata[key];
+  }
   return createHmac('sha256', secret)
     .update('animus-environment-railway/actor-binding/v1\0')
     .update(JSON.stringify(signed))
@@ -267,6 +279,63 @@ function bindingFromHandle(handle: EnvironmentHandle, secret: string): ActorBind
     return { scope, fingerprint, actor: null, actorJson: null };
   }
   throw new Error(`environment handle '${handle.id}' has malformed actor binding metadata`);
+}
+
+function backendCallScopeFromHandle(handle: EnvironmentHandle, secret: string): BackendCallScope {
+  // Reuse the actor verifier so scope metadata is never consumed without a
+  // valid server-side signature.
+  bindingFromHandle(handle, secret);
+  const metadata = handle.metadata as Record<string, unknown>;
+  const rawWorkflowId = metadata.animus_run_id;
+  const workflowId = typeof rawWorkflowId === 'string' && rawWorkflowId.trim() ? rawWorkflowId.trim() : null;
+  const owner = metadata.animus_github_owner;
+  const repo = metadata.animus_github_repo;
+  if ((owner === undefined || owner === null) !== (repo === undefined || repo === null)) {
+    throw new Error(`environment handle '${handle.id}' has incomplete repository scope metadata`);
+  }
+  if (
+    (owner !== undefined && owner !== null && (typeof owner !== 'string' || !owner.trim())) ||
+    (repo !== undefined && repo !== null && (typeof repo !== 'string' || !repo.trim()))
+  ) {
+    throw new Error(`environment handle '${handle.id}' has malformed repository scope metadata`);
+  }
+  return {
+    subjectId: null,
+    workflowId,
+    repository:
+      typeof owner === 'string' && typeof repo === 'string'
+        ? { owner: owner.trim(), repo: repo.trim() }
+        : null,
+  };
+}
+
+function sameBackendPreparedScope(live: BackendCallScope, persisted: BackendCallScope): boolean {
+  return (
+    (persisted.workflowId === null || live.workflowId === persisted.workflowId) &&
+    live.repository?.owner === persisted.repository?.owner &&
+    live.repository?.repo === persisted.repository?.repo
+  );
+}
+
+function bindBackendExecutionScope(
+  scope: BackendCallScope,
+  handleId: string,
+  params: { subject_id: string; workflow_id?: string | null },
+): BackendCallScope {
+  const subjectId = params.subject_id.trim();
+  if (!subjectId) throw new Error('environment exec_session subject_id must be non-empty');
+  if (scope.subjectId && scope.subjectId !== subjectId) {
+    throw new Error(`environment exec_session subject_id does not match handle '${handleId}' binding`);
+  }
+  const requestedWorkflowId = params.workflow_id?.trim() || null;
+  if (scope.workflowId && requestedWorkflowId && scope.workflowId !== requestedWorkflowId) {
+    throw new Error(`environment exec_session workflow_id does not match handle '${handleId}' binding`);
+  }
+  // Legacy standalone callers may omit an id. Assign the secure handle id as a
+  // stable one-run workflow id instead of allowing an unscoped node-generated
+  // id to cross the parent boundary.
+  const workflowId = scope.workflowId ?? requestedWorkflowId ?? handleId;
+  return { ...scope, subjectId, workflowId };
 }
 
 function authorizeActor(expected: ActorBinding, handleId: string, actor: Actor | null | undefined): ActorBinding {
@@ -418,6 +487,10 @@ export interface RailwayHandleMeta {
    *  cold-delete by deterministic name when a caller only has the run id (e.g.
    *  the daemon persisted the run id but crashed before recording service_id). */
   animus_run_id?: string | null;
+  /** Repository scope for GitHub credential re-mints and reverse RPC policy.
+   * Both fields are covered by `animus_actor_binding_mac`. */
+  animus_github_owner?: string | null;
+  animus_github_repo?: string | null;
   /** Workflow-declared cleanup script (TASK-809): a `sh -c` command run IN the
    *  node right before it is destroyed, to flush uncommitted work to its branch
    *  (e.g. `git add -A && git commit -m checkpoint && git push`). Sourced from
@@ -897,6 +970,8 @@ export class RailwayEnvironment {
   /** In-memory authority for live relay handles. Handle metadata is used only
    * to rehydrate this map after a plugin restart, after matching ctx.actor. */
   private readonly actorBindings = new Map<string, ActorBinding>();
+  /** Method + row authority for node-originated backend/call requests. */
+  private readonly backendCallScopes = new Map<string, BackendCallScope>();
   private readonly actorBindingSecret: string;
   private readonly relayBindingSecret: string;
   /** Random per-process identity baked into service names, so a GC sweep can
@@ -983,10 +1058,9 @@ export class RailwayEnvironment {
       // the daemon), everything else → animus-postgres. Omitted → reverse RPC
       // stays unwired and nodes fall back to their own local backends.
       // The `credentials` role serves on-demand GitHub token re-mints for the
-      // node's git credential helper (TASK-855) — installation-wide scope, App
-      // private key never crosses the relay. Wired alongside the backend
-      // passthrough only (an unwired reverse RPC keeps its existing semantics:
-      // nodes fall back to their own local backends).
+      // node's git credential helper (TASK-855) — the trusted handle policy
+      // binds each mint to one repository, and the App private key never
+      // crosses the relay. Wired alongside the backend passthrough only.
       this.relayInstance = await RelayClient.connect({
         socketPath: this.config.relaySocketPath,
         actorId: this.config.relayOwnerId?.trim() || 'animus-environment-railway',
@@ -995,11 +1069,16 @@ export class RailwayEnvironment {
           ? {
               onReverseRpc: makeActorBoundReverseHandler(
                 this.actorBindings,
-                makeBackendCallHandler({
-                  default: backend,
-                  ...(logBackend ? { log_storage: logBackend } : {}),
-                  credentials: makeCredentialsServicer(process.env),
-                }),
+                makeBackendCallHandler(
+                  {
+                    default: backend,
+                    ...(logBackend ? { log_storage: logBackend } : {}),
+                    credentials: makeCredentialsServicer(process.env),
+                  },
+                  {
+                    authorize: makeScopedBackendCallAuthorizer(this.backendCallScopes),
+                  },
+                ),
               ),
             }
           : {}),
@@ -1029,9 +1108,15 @@ export class RailwayEnvironment {
     const runId = specRunId(spec);
     const id = secureHandleId();
     const binding = actorBinding(actor);
+    const repositoryScope = tokenScopeSlug(spec);
     // Bind before register/create: a node can dial and issue reverse RPC as soon
     // as Railway starts it, so no unbound authorization window may exist.
     this.actorBindings.set(id, binding);
+    this.backendCallScopes.set(id, {
+      subjectId: null,
+      workflowId: runId,
+      repository: repositoryScope,
+    });
     const serviceName = runId
       ? deterministicServiceName(projectId, runId)
       : `${this.instancePrefix()}${handleServiceToken(id)}`;
@@ -1074,6 +1159,7 @@ export class RailwayEnvironment {
     } catch (err) {
       if (relay) await Promise.resolve(relay.releaseRun(id)).catch(() => undefined);
       this.actorBindings.delete(id);
+      this.backendCallScopes.delete(id);
       throw err;
     }
 
@@ -1133,6 +1219,7 @@ export class RailwayEnvironment {
       // Roll back the half-prepared run: forget the token, delete the service.
       await Promise.resolve(relay.releaseRun(id)).catch(() => undefined);
       this.actorBindings.delete(id);
+      this.backendCallScopes.delete(id);
       if (serviceId) {
         await this.railway()
           .deleteService(serviceId, environmentId)
@@ -1159,6 +1246,8 @@ export class RailwayEnvironment {
       image,
       primary_subdir: plan.primarySubdir,
       animus_run_id: runId,
+      animus_github_owner: repositoryScope?.owner ?? null,
+      animus_github_repo: repositoryScope?.repo ?? null,
       cleanup,
       animus_actor_scope: binding.scope,
       animus_actor_fingerprint: binding.fingerprint,
@@ -1232,6 +1321,13 @@ export class RailwayEnvironment {
     }
     const binding = authorizeActor(live ?? persisted, handle.id, actor);
     if (!live) this.actorBindings.set(handle.id, binding);
+    const persistedBackendScope = backendCallScopeFromHandle(handle, this.actorBindingSecret);
+    const liveBackendScope = this.backendCallScopes.get(handle.id);
+    if (liveBackendScope && !sameBackendPreparedScope(liveBackendScope, persistedBackendScope)) {
+      throw new Error(`environment handle '${handle.id}' backend scope metadata does not match live authority`);
+    }
+    const backendScope = bindBackendExecutionScope(liveBackendScope ?? persistedBackendScope, handle.id, params);
+    this.backendCallScopes.set(handle.id, backendScope);
     const executionFence = validateExecutionFence(params);
     const relay = await this.relay();
     if (!relay.registeredRuns().includes(handle.id)) {
@@ -1245,9 +1341,12 @@ export class RailwayEnvironment {
     }
     const result = await relay.runSession(
       handle.id,
-      { ...params, execution_fence: executionFence },
+      { ...params, workflow_id: backendScope.workflowId, execution_fence: executionFence },
       onJournal,
     );
+    if (result.workflow_id !== backendScope.workflowId) {
+      throw new Error('environment exec_session response workflow_id does not match bound workflow');
+    }
     if (executionFence) {
       if (result.workflow_id !== executionFence.workflow_id) {
         throw new Error('environment exec_session response workflow_id does not match execution_fence');
@@ -1283,6 +1382,7 @@ export class RailwayEnvironment {
     // credential call). Revoke authority immediately after that bounded hook,
     // before releasing the relay registration or deleting the substrate node.
     this.actorBindings.delete(handle.id);
+    this.backendCallScopes.delete(handle.id);
     const credentials = openRelayBinding(this.relayBindingSecret, handle);
     if (this.relayInstance?.registeredRuns().includes(handle.id)) {
       await Promise.resolve(this.relayInstance.releaseRun(handle.id, credentials ?? undefined));
@@ -1509,6 +1609,7 @@ export class RailwayEnvironment {
   /** Close the relay listener + any parent-side backend plugins (tests / shutdown). */
   async close(): Promise<void> {
     this.actorBindings.clear();
+    this.backendCallScopes.clear();
     if (this.relayInstance) {
       await this.relayInstance.close();
       this.relayInstance = null;
