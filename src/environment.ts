@@ -535,8 +535,8 @@ export interface RailwayEnvironmentConfig {
   /** Hard maximum Railway services this client may manage at once. Defaults
    * to five. Zero disables new prepares without affecting teardown/reap. */
   maxManagedNodes?: number;
-  /** Shared local directory for cross-process admission locks. Every plugin
-   * process belonging to one logical client must see the same directory. */
+  /** Persistent directory for same-host admission coordination and durable
+   * reservations. One logical client must have exactly one admission host. */
   capacityLockRoot?: string;
   /** How long admission keeps its cross-process lock while waiting for a new
    * Railway service to become visible in inventory. */
@@ -574,7 +574,11 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
       env.ANIMUS_ENV_MAX_MANAGED_NODES !== undefined && env.ANIMUS_ENV_MAX_MANAGED_NODES.trim() !== ''
         ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
         : undefined,
-    capacityLockRoot: env.ANIMUS_ENV_CAPACITY_LOCK_DIR,
+    capacityLockRoot:
+      env.ANIMUS_ENV_CAPACITY_LOCK_DIR?.trim() ||
+      (env.RAILWAY_VOLUME_MOUNT_PATH?.trim()
+        ? join(env.RAILWAY_VOLUME_MOUNT_PATH.trim(), 'animus-environment-railway-capacity')
+        : undefined),
     capacityConfirmationTimeoutMs:
       env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS !== undefined &&
       env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS.trim() !== ''

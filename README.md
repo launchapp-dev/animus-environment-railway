@@ -57,13 +57,19 @@ verified. Unknown and legacy `animus-run-*`
 services count against the client cap unless their name is structurally
 attributable to a different cap-aware client. A retry carrying the same stable
 run id reconciles its prior service under admission before the cap is checked,
-so replacing that service does not consume an additional slot. A cross-process
-lock under `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
-`/tmp/animus-environment-railway-capacity`) serializes recount-and-create for
-the same project/client; every process for that client must share this path.
-Back the directory with storage that survives daemon restarts or replacements
-so ambiguous-cleanup reservations remain charged until Railway inventory can
-prove that the service is absent.
+so replacing that service does not consume an additional slot. A host-local,
+cross-process lock keyed by `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
+`$RAILWAY_VOLUME_MOUNT_PATH/animus-environment-railway-capacity` on a Railway
+volume, otherwise `/tmp/animus-environment-railway-capacity`) serializes
+recount-and-create for the same project/client. The hard-cap contract therefore
+requires one admission host for a client; do not run independent plugin hosts
+with the same `ANIMUS_ENV_CLIENT_ID`. This matches Railway services with a persistent volume,
+which Railway does not permit to run with replicas. Multiple plugin processes
+on that host are supported. Back the directory with that host's persistent
+volume so ambiguous-cleanup reservations survive daemon restarts and remain
+charged until Railway inventory can prove that the service is absent. Deploying
+multiple admission hosts requires an external distributed coordinator and is
+not supported by this filesystem setting.
 The lock remains held until the new service appears in Railway inventory. If
 that confirmation exceeds `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS`
 (default 30 seconds), the plugin deletes the unconfirmed service and fails the

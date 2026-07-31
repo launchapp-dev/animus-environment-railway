@@ -78,7 +78,7 @@ const plugin = defineEnvironmentPlugin({
     {
       name: 'ANIMUS_ENV_CAPACITY_LOCK_DIR',
       description:
-        'Shared directory used to serialize node admission across plugin processes and persist ambiguous-cleanup reservations across daemon restarts (default /tmp/animus-environment-railway-capacity).',
+        'Persistent directory for same-host admission serialization and restart-visible ambiguous-cleanup reservations. One admission host is required per client; this is not a distributed lock (defaults to the Railway volume when mounted, otherwise /tmp).',
       required: false,
     },
     {

@@ -720,6 +720,7 @@ describe('pure helpers', () => {
       ANIMUS_ENV_DIAL_TIMEOUT_SECS: '60',
       ANIMUS_ENV_CLIENT_ID: 'portal-production',
       ANIMUS_ENV_MAX_MANAGED_NODES: '7',
+      RAILWAY_VOLUME_MOUNT_PATH: '/data',
       ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS: '1234',
     } as NodeJS.ProcessEnv);
     expect(config).toMatchObject({
@@ -730,6 +731,7 @@ describe('pure helpers', () => {
       dialTimeoutSecs: 60,
       clientId: 'portal-production',
       maxManagedNodes: 7,
+      capacityLockRoot: '/data/animus-environment-railway-capacity',
       capacityConfirmationTimeoutMs: 1234,
     });
     expect(DEFAULT_MAX_MANAGED_NODES).toBe(5);
@@ -743,6 +745,12 @@ describe('pure helpers', () => {
     expect(
       configFromEnv({ ANIMUS_ENV_MAX_MANAGED_NODES: '0' } as NodeJS.ProcessEnv).maxManagedNodes,
     ).toBe(0);
+    expect(
+      configFromEnv({
+        RAILWAY_VOLUME_MOUNT_PATH: '/data',
+        ANIMUS_ENV_CAPACITY_LOCK_DIR: '/custom/capacity',
+      } as NodeJS.ProcessEnv).capacityLockRoot,
+    ).toBe('/custom/capacity');
     expect(
       configFromEnv({ ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS: '0' } as NodeJS.ProcessEnv)
         .capacityConfirmationTimeoutMs,

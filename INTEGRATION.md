@@ -45,9 +45,17 @@ Unit tests mock fetch / the Railway API. To run the gated integration suite
   Setting it to `0` rejects prepares before inventory or same-run
   reconciliation, preserving existing services while teardown and reap remain
   available.
-- `ANIMUS_ENV_CAPACITY_LOCK_DIR` — directory shared by all local environment
-  plugin processes for that client and persisted across daemon restarts or
-  replacements; defaults to `/tmp/animus-environment-railway-capacity`
+- `ANIMUS_ENV_CAPACITY_LOCK_DIR` — persistent directory used by every
+  environment-plugin process on the client's single admission host; defaults
+  to `$RAILWAY_VOLUME_MOUNT_PATH/animus-environment-railway-capacity` when a
+  Railway volume is mounted, otherwise
+  `/tmp/animus-environment-railway-capacity`. The lock is host-local while
+  reservation files are restart-visible. Do not run independent plugin hosts
+  with the same `ANIMUS_ENV_CLIENT_ID`: this setting is not a distributed
+  coordinator. On Railway, mount a persistent volume and keep the service at
+  one replica (Railway does not support replicas with volumes); the plugin
+  automatically places reservations on that volume unless explicitly
+  overridden.
 - `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS` — maximum time admission waits
   for a created service to appear in Railway inventory before deleting it and
   failing closed (default `30000`). An ambiguous create or failed rollback is
