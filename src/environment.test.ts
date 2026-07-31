@@ -775,6 +775,13 @@ describe('pure helpers', () => {
       () =>
         new RailwayEnvironment({
           railway: new FakeRailway(),
+          config: { maxManagedNodes: -1 },
+        }),
+    ).toThrow(/ANIMUS_ENV_MAX_MANAGED_NODES must be a non-negative integer/);
+    expect(
+      () =>
+        new RailwayEnvironment({
+          railway: new FakeRailway(),
           config: { capacityConfirmationTimeoutMs: -1 },
         }),
     ).toThrow(/CAPACITY_CONFIRMATION_TIMEOUT_MS must be a non-negative integer/);
