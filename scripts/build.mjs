@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const outfile = join(root, 'dist', 'animus-environment-railway');
-const expectedTransportVersion = '0.3.2';
+const expectedTransportVersion = '0.3.4';
 const expectedEnvironmentBaseCommit = '56a370a2bf622ef009e90f2004353b89f8a7ad4c';
 const transportPackage = JSON.parse(
   readFileSync(

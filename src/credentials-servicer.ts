@@ -4,21 +4,33 @@
 // token at every push, so the 1h installation-token lifetime no longer bounds
 // how long a run may live before it can push.
 //
-// Scope: mints INSTALLATION-WIDE tokens (the same scope a bare broker node
-// receives at spawn) rather than per-run repo-scoped ones — the relay handler
-// is shared by every run in the plugin process, and an installation-wide token
-// is correct for all of them; per-run repo scoping at refresh time would
-// require handle-identity threading through the reverse RPC and buys nothing
-// for a single-org fleet. The App PRIVATE KEY never crosses the relay; only
-// the minted short-lived token does. Token values are never logged.
+// Scope: every request MUST carry the repository selected by the trusted
+// handle policy. The servicer resolves that repository's installation and asks
+// GitHub for a one-repository token. It never returns an installation-wide App
+// token or a static host PAT to the least-trusted node. The App PRIVATE KEY
+// never crosses the relay; only the minted short-lived token does. Token values
+// are never logged.
 import { githubAppJwt } from './environment.js';
 
 interface CredentialsCache {
-  installId?: string;
+  installationByRepository: Map<string, string>;
 }
 
 export interface CredentialsServicer {
   call(method: string, params: unknown): Promise<unknown>;
+}
+
+function repositoryScope(params: unknown): { owner: string; repo: string } {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    throw new Error('credentials servicer: git/token requires repository scope');
+  }
+  const record = params as Record<string, unknown>;
+  const owner = typeof record.owner === 'string' ? record.owner.trim() : '';
+  const repo = typeof record.repo === 'string' ? record.repo.trim() : '';
+  if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)) {
+    throw new Error('credentials servicer: git/token repository scope is invalid');
+  }
+  return { owner, repo };
 }
 
 export function makeCredentialsServicer(
@@ -26,21 +38,17 @@ export function makeCredentialsServicer(
   fetchImpl: typeof fetch = fetch,
   nowFn: () => number = () => Math.floor(Date.now() / 1000),
 ): CredentialsServicer {
-  const cache: CredentialsCache = {};
+  const cache: CredentialsCache = { installationByRepository: new Map() };
   return {
-    async call(method: string, _params: unknown): Promise<unknown> {
+    async call(method: string, params: unknown): Promise<unknown> {
       if (method !== 'git/token') {
         throw new Error(`credentials servicer: unknown method '${method}'`);
       }
+      const scope = repositoryScope(params);
       const appId = hostEnv.GITHUB_APP_ID;
       const rawKey = hostEnv.GITHUB_APP_PRIVATE_KEY;
       if (!appId || !rawKey) {
-        // No App configured: fall back to the static host token when present
-        // (same value the node already holds — better than a hard failure).
-        if (hostEnv.GITHUB_TOKEN) {
-          return { token: hostEnv.GITHUB_TOKEN, expires_at: null, source: 'static' };
-        }
-        throw new Error('credentials servicer: GitHub App not configured and no GITHUB_TOKEN fallback');
+        throw new Error('credentials servicer: repository-scoped GitHub App credentials are not configured');
       }
       const privateKey = rawKey.includes('\\n') ? rawKey.replace(/\\n/g, '\n') : rawKey;
       const jwt = githubAppJwt(appId, privateKey, nowFn());
@@ -59,21 +67,25 @@ export function makeCredentialsServicer(
         }
         return (await res.json()) as T;
       };
-      // Resolve the installation once per servicer lifetime; every subsequent
-      // mint is a single POST to access_tokens.
-      if (cache.installId === undefined) {
-        if (hostEnv.GITHUB_APP_INSTALLATION_ID) {
-          cache.installId = hostEnv.GITHUB_APP_INSTALLATION_ID;
-        } else {
-          const installs = await gh<Array<{ id: unknown }>>('/app/installations');
-          const first = Array.isArray(installs) ? installs[0] : undefined;
-          if (!first) throw new Error('credentials servicer: GitHub App has no installations');
-          cache.installId = String(first.id);
+      const key = `${scope.owner.toLowerCase()}/${scope.repo.toLowerCase()}`;
+      let installId = cache.installationByRepository.get(key);
+      if (!installId) {
+        const installation = await gh<{ id?: unknown }>(
+          `/repos/${encodeURIComponent(scope.owner)}/${encodeURIComponent(scope.repo)}/installation`,
+        );
+        if (installation.id === undefined || installation.id === null) {
+          throw new Error('credentials servicer: GitHub returned no repository installation id');
         }
+        installId = String(installation.id);
+        cache.installationByRepository.set(key, installId);
       }
       const minted = await gh<{ token?: unknown; expires_at?: unknown }>(
-        `/app/installations/${cache.installId}/access_tokens`,
-        { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' },
+        `/app/installations/${installId}/access_tokens`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ repositories: [scope.repo] }),
+        },
       );
       if (typeof minted.token !== 'string' || minted.token.length === 0) {
         throw new Error('credentials servicer: GitHub returned no token');

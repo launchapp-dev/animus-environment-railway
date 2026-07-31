@@ -40,6 +40,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from 'node:f
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { assertReleaseManifest } from './release-identity.mjs';
+
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const distDir = join(root, 'dist');
@@ -90,6 +92,11 @@ if (!['1', 'true', 'yes'].includes((process.env.ANIMUS_RELEASE_SKIP_INSTALL ?? '
 run('npm', ['run', 'bundle']);
 
 statSync(bin); // fail loudly if the bundle is missing
+const manifest = assertReleaseManifest(execFileSync(bin, ['--manifest'], { encoding: 'utf8' }), {
+  expectedName: binName,
+  expectedVersion: version,
+});
+process.stdout.write(`verified bundle manifest ${manifest.name}@${manifest.version}\n`);
 
 // 3. package one tarball per target (same bundle bytes) + a per-asset sidecar.
 rmSync(releaseDir, { recursive: true, force: true });

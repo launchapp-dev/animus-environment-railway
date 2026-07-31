@@ -1873,6 +1873,29 @@ describe('prepare -> exec_session actor binding', () => {
     expect(relay.sessions).toHaveLength(1);
   });
 
+  it('rejects forged workflow and repository scope metadata', async () => {
+    const { env, handle } = await boundEnvironment(alice);
+    for (const metadata of [
+      { ...(handle.metadata as Record<string, unknown>), animus_run_id: 'wf-attacker' },
+      {
+        ...(handle.metadata as Record<string, unknown>),
+        animus_github_owner: 'attacker',
+        animus_github_repo: 'other',
+      },
+    ]) {
+      await expect(
+        env.runSession(
+          { ...handle, metadata },
+          { subject_id: 'task:TASK-1' },
+          undefined,
+          alice,
+          alice,
+          true,
+        ),
+      ).rejects.toThrow(/invalid actor binding signature|does not match live authority/);
+    }
+  });
+
   it('rehydrates only metadata signed by the same stable server secret', async () => {
     const { handle, relay } = await boundEnvironment(alice);
     const fake = new FakeRailway();
