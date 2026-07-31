@@ -47,7 +47,12 @@ Unit tests mock fetch / the Railway API. To run the gated integration suite
   `/tmp/animus-environment-railway-capacity`
 - `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS` — maximum time admission waits
   for a created service to appear in Railway inventory before deleting it and
-  failing closed (default `30000`)
+  failing closed (default `30000`). An ambiguous create or failed rollback is
+  retained as a durable reservation in the capacity lock directory, so the
+  slot remains charged across restarts until inventory or teardown verifies
+  that service is absent. Reservation files that cannot be decoded are also
+  charged conservatively and require operator inspection rather than silently
+  reopening capacity.
 - `ANIMUS_ENV_RELAY_PUBLIC_URL` — a `wss://` URL reachable FROM Railway that
   routes to this plugin's relay port (`ANIMUS_ENV_RELAY_PORT`); on Railway this
   is the daemon service's public domain with the relay port exposed.
