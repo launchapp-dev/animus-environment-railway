@@ -1004,8 +1004,10 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     // Once Railway exposes the retained service, an explicit lifecycle delete
     // proves it is gone and releases the durable reservation.
     fake.listed = [{ id: 'svc-1', name: fake.created[0]!.name }];
+    fake.trackCreatedServices = true;
     fake.deleteService = FakeRailway.prototype.deleteService.bind(fake);
     await expect(envA.teardownNode('svc-1')).resolves.toEqual(['svc-1']);
+    fake.trackCreatedServices = false;
     await expect(envB.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(
       /did not confirm created service/,
     );
@@ -1096,7 +1098,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
 
     // Model a daemon restart. Once inventory is healthy and authoritatively
     // empty, the next process must reconcile the named intent and create.
-    fake.listRunServices = async () => [];
+    fake.listRunServices = FakeRailway.prototype.listRunServices.bind(fake);
     fake.createRunService = FakeRailway.prototype.createRunService.bind(fake);
     fake.trackCreatedServices = true;
     const restarted = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
