@@ -733,6 +733,16 @@ describe('pure helpers', () => {
       capacityConfirmationTimeoutMs: 1234,
     });
     expect(DEFAULT_MAX_MANAGED_NODES).toBe(5);
+    expect(
+      configFromEnv({ ANIMUS_ENV_MAX_MANAGED_NODES: '   ' } as NodeJS.ProcessEnv).maxManagedNodes,
+    ).toBeUndefined();
+    expect(
+      configFromEnv({ ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS: '   ' } as NodeJS.ProcessEnv)
+        .capacityConfirmationTimeoutMs,
+    ).toBeUndefined();
+    expect(
+      configFromEnv({ ANIMUS_ENV_MAX_MANAGED_NODES: '0' } as NodeJS.ProcessEnv).maxManagedNodes,
+    ).toBe(0);
     expect(configFromEnv({ RAILWAY_TOKEN: 'railway-secret' } as NodeJS.ProcessEnv).actorBindingSecret).toBe(
       'railway-secret',
     );
@@ -967,6 +977,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     fake.listed = [
       { id: 'legacy-deterministic', name: `${SERVICE_NAME_PREFIX}${'a'.repeat(12)}` },
       { id: 'legacy-random', name: `${SERVICE_NAME_PREFIX}i123abc-r1234567890` },
+      { id: 'legacy-unknown', name: `${SERVICE_NAME_PREFIX}older-format` },
     ];
     const relay = new RecordingRelay();
     const env = new RailwayEnvironment({
@@ -976,12 +987,12 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
         projectId: 'proj-1',
         environmentId: 'env-1',
         clientId: 'portal-production',
-        maxManagedNodes: 2,
+        maxManagedNodes: 3,
       },
     });
     live.push({ env, fake });
 
-    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/2\/2 managed nodes/);
+    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/3\/3 managed nodes/);
     expect(fake.created).toHaveLength(0);
   });
 
@@ -1004,6 +1015,12 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/0\/0 managed nodes/);
     expect(fake.created).toHaveLength(0);
     expect(relay.releases).toHaveLength(1);
+
+    // Capacity is an admission-only guard: operators must still be able to
+    // drain existing nodes while new prepares are intentionally disabled.
+    fake.listed = [{ id: 'svc-existing', name: `${SERVICE_NAME_PREFIX}existing` }];
+    await expect(env.teardownNode('svc-existing')).resolves.toEqual(['svc-existing']);
+    expect(fake.deleted).toContainEqual({ serviceId: 'svc-existing', environmentId: 'env-1' });
   });
 
   it('defaults to five and counts restart-visible nodes only for the configured client', async () => {
@@ -1013,8 +1030,14 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const ownPrefix = clientServicePrefix('proj-1', clientId);
     const otherPrefix = clientServicePrefix('proj-1', 'another-client');
     fake.listed = [
-      ...Array.from({ length: 5 }, (_, i) => ({ id: `other-${i}`, name: `${otherPrefix}${i}` })),
-      ...Array.from({ length: 5 }, (_, i) => ({ id: `own-${i}`, name: `${ownPrefix}${i}` })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        id: `other-${i}`,
+        name: `${otherPrefix}${i.toString(16).padStart(10, '0')}`,
+      })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        id: `own-${i}`,
+        name: `${ownPrefix}${i.toString(16).padStart(10, '0')}`,
+      })),
     ];
     const relay = new RecordingRelay();
     const env = new RailwayEnvironment({

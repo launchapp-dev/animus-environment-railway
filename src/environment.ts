@@ -367,6 +367,13 @@ export function deterministicServiceName(projectId: string, clientId: string, ru
   return `${clientServicePrefix(projectId, clientId)}${digest}`;
 }
 
+/** New cap-aware names are the only run-service names that can be safely
+ * attributed to a different logical client. Everything else under the shared
+ * run prefix is legacy/unknown and must be charged conservatively. */
+function isCapAwareServiceName(name: string): boolean {
+  return /^animus-run-[0-9a-f]{8}-(?:[0-9a-f]{10}|r[0-9a-f]{10})$/.test(name);
+}
+
 /** Pre-cap deterministic name retained for cold teardown/reconciliation. */
 function legacyDeterministicServiceName(projectId: string, runId: string): string {
   const digest = createHash('sha256').update(JSON.stringify([projectId, runId])).digest('hex').slice(0, 12);
@@ -554,13 +561,19 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
     relayOwnerId: env.ANIMUS_ENV_RELAY_OWNER_ID,
     relayControlToken: env.ANIMUS_ENV_RELAY_CONTROL_TOKEN,
     clientId: env.ANIMUS_ENV_CLIENT_ID,
-    maxManagedNodes: env.ANIMUS_ENV_MAX_MANAGED_NODES
-      ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
-      : undefined,
+    // Treat blank/whitespace-only configuration as unset. In particular,
+    // Number('   ') is zero, which must not accidentally turn a templated but
+    // empty environment variable into an intentional admission shutdown.
+    maxManagedNodes:
+      env.ANIMUS_ENV_MAX_MANAGED_NODES !== undefined && env.ANIMUS_ENV_MAX_MANAGED_NODES.trim() !== ''
+        ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
+        : undefined,
     capacityLockRoot: env.ANIMUS_ENV_CAPACITY_LOCK_DIR,
-    capacityConfirmationTimeoutMs: env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS
-      ? Number(env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS)
-      : undefined,
+    capacityConfirmationTimeoutMs:
+      env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS !== undefined &&
+      env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS.trim() !== ''
+        ? Number(env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS)
+        : undefined,
   };
 }
 
@@ -1095,8 +1108,14 @@ export class RailwayEnvironment {
       releaseFileLock = await this.acquireCapacityLock(scope);
       return await operation();
     } finally {
-      await releaseFileLock?.();
-      release();
+      // Always advance the in-process queue, even if releasing the
+      // cross-process lock fails. Otherwise one cleanup error permanently
+      // strands every later prepare behind an unresolved admissionTail.
+      try {
+        await releaseFileLock?.();
+      } finally {
+        release();
+      }
     }
   }
 
@@ -1165,11 +1184,10 @@ export class RailwayEnvironment {
           .filter(
             (service) =>
               service.name.startsWith(scope) ||
-              // Pre-cap names do not encode a logical client. Count them
-              // conservatively for every client rather than risk exceeding a
-              // configured safety limit during a rolling upgrade.
-              /^animus-run-[0-9a-f]{12}$/.test(service.name) ||
-              /^animus-run-i[0-9a-f]{6}-/.test(service.name),
+              // Only a valid cap-aware name can be safely assigned to another
+              // client. Count every legacy or unknown run name conservatively
+              // rather than risk exceeding the limit during a rolling upgrade.
+              (service.name.startsWith(SERVICE_NAME_PREFIX) && !isCapAwareServiceName(service.name)),
           )
           .map((service) => service.id),
       );
