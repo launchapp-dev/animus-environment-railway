@@ -61,7 +61,12 @@ the same project/client; every process for that client must share this path.
 The lock remains held until the new service appears in Railway inventory. If
 that confirmation exceeds `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS`
 (default 30 seconds), the plugin deletes the unconfirmed service and fails the
-prepare closed. Service names contain only a hash of the client id.
+prepare closed. If creation is ambiguous or that cleanup delete fails, the
+plugin keeps a durable reservation under the capacity lock directory and
+continues charging the slot across restarts until successful inventory or
+teardown proves the service absent. Corrupt or incomplete reservation records
+remain charged instead of reopening capacity. Service names contain only a
+hash of the client id.
 
 `exec_session` actor authority is bound at prepare time. The plugin injects
 only the SDK-authenticated actor as `ANIMUS_ACTOR_JSON`, signs the persisted

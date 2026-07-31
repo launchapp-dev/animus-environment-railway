@@ -1458,6 +1458,51 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.deleted.map((d) => d.serviceId)).not.toContain('svc-live');
   });
 
+  it('gcOrphans serializes its full cleanup with a same-run retry', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const runId = 'gc-retry';
+    const serviceName = deterministicServiceName('proj-1', 'portal-production', runId);
+    fake.listed = [{ id: 'svc-old', name: serviceName }];
+    let releaseDelete!: () => void;
+    const deleteBlocked = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    let deleteStarted!: () => void;
+    const deleting = new Promise<void>((resolve) => { deleteStarted = resolve; });
+    let firstDelete = true;
+    fake.deleteService = async (serviceId, environmentId) => {
+      fake.deleted.push({ serviceId, environmentId });
+      if (firstDelete) {
+        firstDelete = false;
+        deleteStarted();
+        await deleteBlocked;
+      }
+      fake.listed = fake.listed.filter((service) => service.id !== serviceId);
+    };
+    fake.createRunService = async (input) => {
+      fake.created.push(input);
+      throw new Error('create reached');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1', environmentId: 'env-1', clientId: 'portal-production', capacityLockRoot,
+    };
+    const gcEnv = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    const retryEnv = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: gcEnv, fake }, { env: retryEnv, fake });
+
+    const gc = gcEnv.gcOrphans({ allInstances: true });
+    await deleting;
+    const retry = retryEnv.prepare({
+      spec: { kind: 'railway', metadata: { animus_run_id: runId } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(fake.created).toHaveLength(0);
+    releaseDelete();
+    await expect(gc).resolves.toEqual(['svc-old']);
+    await expect(retry).rejects.toThrow('create reached');
+    expect(fake.created).toHaveLength(1);
+  });
+
   it('list reports nodes with state + a state-based orphan flag', async () => {
     const { env, fake } = await makeEnv();
     fake.detailed = [
@@ -1501,6 +1546,53 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(res.deleted.sort()).toEqual(['svc-crash', 'svc-fail']);
     expect(res.kept.map((n) => n.id)).toEqual(['svc-ok']);
     expect(fake.deleted.map((d) => d.serviceId).sort()).toEqual(['svc-crash', 'svc-fail']);
+  });
+
+  it('reap serializes its full cleanup with a same-run retry', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const runId = 'reap-retry';
+    const serviceName = deterministicServiceName('proj-1', 'portal-production', runId);
+    fake.detailed = [{ id: 'svc-old', name: serviceName, status: 'FAILED', createdAt: null }];
+    fake.listed = [{ id: 'svc-old', name: serviceName }];
+    let releaseDelete!: () => void;
+    const deleteBlocked = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    let deleteStarted!: () => void;
+    const deleting = new Promise<void>((resolve) => { deleteStarted = resolve; });
+    let firstDelete = true;
+    fake.deleteService = async (serviceId, environmentId) => {
+      fake.deleted.push({ serviceId, environmentId });
+      if (firstDelete) {
+        firstDelete = false;
+        deleteStarted();
+        await deleteBlocked;
+      }
+      fake.listed = fake.listed.filter((service) => service.id !== serviceId);
+      fake.detailed = fake.detailed?.filter((service) => service.id !== serviceId) ?? null;
+    };
+    fake.createRunService = async (input) => {
+      fake.created.push(input);
+      throw new Error('create reached');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1', environmentId: 'env-1', clientId: 'portal-production', capacityLockRoot,
+    };
+    const reapEnv = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    const retryEnv = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: reapEnv, fake }, { env: retryEnv, fake });
+
+    const reap = reapEnv.reap();
+    await deleting;
+    const retry = retryEnv.prepare({
+      spec: { kind: 'railway', metadata: { animus_run_id: runId } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(fake.created).toHaveLength(0);
+    releaseDelete();
+    await expect(reap).resolves.toMatchObject({ deleted: ['svc-old'] });
+    await expect(retry).rejects.toThrow('create reached');
+    expect(fake.created).toHaveLength(1);
   });
 
   it('reap dry_run reports the plan without deleting anything', async () => {

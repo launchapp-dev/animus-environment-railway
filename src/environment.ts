@@ -1816,27 +1816,30 @@ export class RailwayEnvironment {
     if (!target) throw new Error('gcOrphans needs a project id (RAILWAY_PROJECT_ID or argument)');
     const environmentId = opts.environmentId ?? this.config.environmentId;
     if (!environmentId) throw new Error('gcOrphans needs an environment id (RAILWAY_ENVIRONMENT_ID or argument)');
-    const services = await this.railway().listRunServices(target);
-    const clientPrefix = clientServicePrefix(target, this.clientId);
-    const liveHandles = new Set(
-      (this.relayInstance?.registeredRuns() ?? []).flatMap((handleId) => [
-        `${clientPrefix}${handleServiceToken(handleId)}`,
-        `${this.instancePrefix()}${handleServiceToken(handleId)}`,
-      ]),
-    );
-    const removed: string[] = [];
-    for (const svc of services) {
-      if (!svc.name.startsWith(SERVICE_NAME_PREFIX)) continue;
-      if (!opts.allInstances && !this.locallyManagedServices.has(svc.id) && !svc.name.startsWith(this.instancePrefix())) {
-        continue;
+    const admissionScope = JSON.stringify([target, this.clientId]);
+    return this.withAdmissionLock(admissionScope, async () => {
+      const services = await this.railway().listRunServices(target);
+      const clientPrefix = clientServicePrefix(target, this.clientId);
+      const liveHandles = new Set(
+        (this.relayInstance?.registeredRuns() ?? []).flatMap((handleId) => [
+          `${clientPrefix}${handleServiceToken(handleId)}`,
+          `${this.instancePrefix()}${handleServiceToken(handleId)}`,
+        ]),
+      );
+      const removed: string[] = [];
+      for (const svc of services) {
+        if (!svc.name.startsWith(SERVICE_NAME_PREFIX)) continue;
+        if (!opts.allInstances && !this.locallyManagedServices.has(svc.id) && !svc.name.startsWith(this.instancePrefix())) {
+          continue;
+        }
+        if (liveHandles.has(svc.name)) continue;
+        await this.railway().deleteService(svc.id, environmentId);
+        this.locallyManagedServices.delete(svc.id);
+        await this.clearCapacityReservation(target, svc.id, svc.name);
+        removed.push(svc.id);
       }
-      if (liveHandles.has(svc.name)) continue;
-      await this.railway().deleteService(svc.id, environmentId);
-      this.locallyManagedServices.delete(svc.id);
-      await this.clearCapacityReservation(target, svc.id, svc.name);
-      removed.push(svc.id);
-    }
-    return removed;
+      return removed;
+    });
   }
 
   /** Node-management (`environment/list`): describe every `animus-run-*` service
@@ -1924,53 +1927,56 @@ export class RailwayEnvironment {
     const environmentId = this.config.environmentId;
     if (!projectId) throw new Error('reap needs a project id (RAILWAY_PROJECT_ID)');
     if (!environmentId) throw new Error('reap needs an environment id (RAILWAY_ENVIRONMENT_ID)');
-    const nodes = await this.describeNodes(projectId);
-    // Protected set = names of runs KNOWN to be live. Two authoritative sources,
-    // unioned: (1) this process's in-memory relay registrations (only meaningful
-    // in the resident daemon), and (2) the daemon-supplied live run ids mapped to
-    // their deterministic service names (works from a fresh CLI process too).
-    const liveNames = new Set(
-      (this.relayInstance?.registeredRuns() ?? []).map(
-        (handleId) => `${clientServicePrefix(projectId, this.clientId)}${handleServiceToken(handleId)}`,
-      ),
-    );
-    const ownerKnown = opts.liveRunIds !== undefined;
-    for (const rid of opts.liveRunIds ?? []) {
-      liveNames.add(deterministicServiceName(projectId, this.clientId, rid));
-      liveNames.add(legacyDeterministicServiceName(projectId, rid));
-    }
-    // In owner-known mode enforce a grace floor so a mid-prepare node (created
-    // before the daemon leased its run) is never reaped out from under itself.
-    const graceSecs = ownerKnown
-      ? Math.max(opts.olderThanSecs ?? 0, REAP_LEAKED_GRACE_SECS)
-      : opts.olderThanSecs;
-    const now = Date.now();
-    const deleted: string[] = [];
-    const kept: EnvironmentNodeDescriptor[] = [];
-    for (const node of nodes) {
-      const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
-      const live = liveNames.has(node.name);
-      const oldEnough =
-        graceSecs === undefined ||
-        (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= graceSecs : true);
-      let reapIt = false;
-      if (dead && oldEnough) reapIt = true;
-      // Owner-known: a healthy node mapping to no live run id is a leak — reap it
-      // WITHOUT `force` (the daemon's live set is authoritative). Legacy path
-      // (no live set supplied) keeps the `all`+`force` empty-liveness guard.
-      else if (!live && oldEnough && (ownerKnown || (opts.all && opts.force))) reapIt = true;
-      if (!reapIt) {
-        kept.push(node);
-        continue;
+    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    return this.withAdmissionLock(admissionScope, async () => {
+      const nodes = await this.describeNodes(projectId);
+      // Protected set = names of runs KNOWN to be live. Two authoritative sources,
+      // unioned: (1) this process's in-memory relay registrations (only meaningful
+      // in the resident daemon), and (2) the daemon-supplied live run ids mapped to
+      // their deterministic service names (works from a fresh CLI process too).
+      const liveNames = new Set(
+        (this.relayInstance?.registeredRuns() ?? []).map(
+          (handleId) => `${clientServicePrefix(projectId, this.clientId)}${handleServiceToken(handleId)}`,
+        ),
+      );
+      const ownerKnown = opts.liveRunIds !== undefined;
+      for (const rid of opts.liveRunIds ?? []) {
+        liveNames.add(deterministicServiceName(projectId, this.clientId, rid));
+        liveNames.add(legacyDeterministicServiceName(projectId, rid));
       }
-      if (!opts.dryRun) {
-        await this.railway().deleteService(node.id, environmentId);
-        this.locallyManagedServices.delete(node.id);
-        await this.clearCapacityReservation(projectId, node.id, node.name);
+      // In owner-known mode enforce a grace floor so a mid-prepare node (created
+      // before the daemon leased its run) is never reaped out from under itself.
+      const graceSecs = ownerKnown
+        ? Math.max(opts.olderThanSecs ?? 0, REAP_LEAKED_GRACE_SECS)
+        : opts.olderThanSecs;
+      const now = Date.now();
+      const deleted: string[] = [];
+      const kept: EnvironmentNodeDescriptor[] = [];
+      for (const node of nodes) {
+        const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
+        const live = liveNames.has(node.name);
+        const oldEnough =
+          graceSecs === undefined ||
+          (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= graceSecs : true);
+        let reapIt = false;
+        if (dead && oldEnough) reapIt = true;
+        // Owner-known: a healthy node mapping to no live run id is a leak — reap it
+        // WITHOUT `force` (the daemon's live set is authoritative). Legacy path
+        // (no live set supplied) keeps the `all`+`force` empty-liveness guard.
+        else if (!live && oldEnough && (ownerKnown || (opts.all && opts.force))) reapIt = true;
+        if (!reapIt) {
+          kept.push(node);
+          continue;
+        }
+        if (!opts.dryRun) {
+          await this.railway().deleteService(node.id, environmentId);
+          this.locallyManagedServices.delete(node.id);
+          await this.clearCapacityReservation(projectId, node.id, node.name);
+        }
+        deleted.push(node.id);
       }
-      deleted.push(node.id);
-    }
-    return { deleted, kept, dryRun: opts.dryRun === true };
+      return { deleted, kept, dryRun: opts.dryRun === true };
+    });
   }
 
   /** Shared listing used by list/get/reap: prefer the state-aware query, fall
