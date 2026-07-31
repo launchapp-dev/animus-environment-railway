@@ -46,8 +46,8 @@ Unit tests mock fetch / the Railway API. To run the gated integration suite
   reconciliation, preserving existing services while teardown and reap remain
   available.
 - `ANIMUS_ENV_CAPACITY_LOCK_DIR` — directory shared by all local environment
-  plugin processes for that client; defaults to
-  `/tmp/animus-environment-railway-capacity`
+  plugin processes for that client and persisted across daemon restarts or
+  replacements; defaults to `/tmp/animus-environment-railway-capacity`
 - `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS` — maximum time admission waits
   for a created service to appear in Railway inventory before deleting it and
   failing closed (default `30000`). An ambiguous create or failed rollback is

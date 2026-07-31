@@ -61,6 +61,9 @@ so replacing that service does not consume an additional slot. A cross-process
 lock under `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
 `/tmp/animus-environment-railway-capacity`) serializes recount-and-create for
 the same project/client; every process for that client must share this path.
+Back the directory with storage that survives daemon restarts or replacements
+so ambiguous-cleanup reservations remain charged until Railway inventory can
+prove that the service is absent.
 The lock remains held until the new service appears in Railway inventory. If
 that confirmation exceeds `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS`
 (default 30 seconds), the plugin deletes the unconfirmed service and fails the
