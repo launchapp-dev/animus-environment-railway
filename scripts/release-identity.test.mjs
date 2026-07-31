@@ -4,31 +4,31 @@ import { assertReleaseManifest } from './release-identity.mjs';
 
 const expected = {
   expectedName: 'animus-environment-railway',
-  expectedVersion: '0.4.22',
+  expectedVersion: '0.4.23',
 };
 
 describe('assertReleaseManifest', () => {
   it('accepts the exact plugin name and package version', () => {
     expect(
       assertReleaseManifest(
-        JSON.stringify({ name: 'animus-environment-railway', version: '0.4.22' }),
+        JSON.stringify({ name: 'animus-environment-railway', version: '0.4.23' }),
         expected,
       ),
-    ).toEqual({ name: 'animus-environment-railway', version: '0.4.22' });
+    ).toEqual({ name: 'animus-environment-railway', version: '0.4.23' });
   });
 
   it('rejects a stale executable version', () => {
     expect(() =>
       assertReleaseManifest(
-        JSON.stringify({ name: 'animus-environment-railway', version: '0.4.21' }),
+        JSON.stringify({ name: 'animus-environment-railway', version: '0.4.22' }),
         expected,
       ),
-    ).toThrow('refusing to release animus-environment-railway@0.4.21 as 0.4.22');
+    ).toThrow('refusing to release animus-environment-railway@0.4.22 as 0.4.23');
   });
 
   it('rejects an unexpected plugin name', () => {
     expect(() =>
-      assertReleaseManifest(JSON.stringify({ name: 'wrong-plugin', version: '0.4.22' }), expected),
+      assertReleaseManifest(JSON.stringify({ name: 'wrong-plugin', version: '0.4.23' }), expected),
     ).toThrow('expected plugin name animus-environment-railway');
   });
 
