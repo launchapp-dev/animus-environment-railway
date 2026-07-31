@@ -24,11 +24,13 @@ import {
 } from '@launchapp-dev/animus-environment-base';
 
 import {
+  claudeConfigDir,
   claudeNodeCredentials,
   cloneCommands,
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
   DEFAULT_CODEX_OAUTH_HOME,
+  DEFAULT_CLAUDE_CONFIG_DIR,
   DEFAULT_IMAGE,
   githubAppCredentials,
   harnessCredentialVars,
@@ -354,6 +356,13 @@ describe('pure helpers', () => {
     expect(DEFAULT_CODEX_OAUTH_HOME).toBe('/data/animus-state/codex-config');
   });
 
+  it('resolves the durable Claude config fallback only when the env is unset', () => {
+    const explicit = mkdtempSync(join(tmpdir(), 'claude-explicit-'));
+    expect(claudeConfigDir({} as NodeJS.ProcessEnv)).toBe(DEFAULT_CLAUDE_CONFIG_DIR);
+    expect(claudeConfigDir({ CLAUDE_CONFIG_DIR: explicit } as NodeJS.ProcessEnv)).toBe(explicit);
+    expect(claudeConfigDir({ CLAUDE_CONFIG_DIR: '' } as NodeJS.ProcessEnv)).toBeNull();
+  });
+
   it('harnessCredentialVars skips missing creds (best-effort)', () => {
     expect(harnessCredentialVars({ CODEX_OAUTH_HOME: '/nonexistent-codex-home' } as NodeJS.ProcessEnv)).toEqual({});
   });
@@ -372,6 +381,26 @@ describe('pure helpers', () => {
     expect(injected.claudeAiOauth.accessToken).toBe('A');
     expect(injected.claudeAiOauth.refreshToken).toBeUndefined();
     expect(injected.claudeAiOauth.scopes).toEqual(['x']);
+  });
+
+  it('claudeNodeCredentials loads a valid token from the fallback when the env is unset', async () => {
+    const fallbackDir = mkdtempSync(join(tmpdir(), 'claude-default-'));
+    const now = 1_000_000;
+    writeFileSync(
+      join(fallbackDir, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'fallback-A', refreshToken: 'R', expiresAt: now + 3_600_000 } }),
+    );
+    const vars = await claudeNodeCredentials(
+      {} as NodeJS.ProcessEnv,
+      now,
+      (async () => {
+        throw new Error('must not refresh a valid fallback token');
+      }) as unknown as typeof fetch,
+      fallbackDir,
+    );
+    const injected = JSON.parse(Buffer.from(vars.ANIMUS_NODE_CLAUDE_CREDENTIALS_B64, 'base64').toString());
+    expect(injected.claudeAiOauth.accessToken).toBe('fallback-A');
+    expect(injected.claudeAiOauth.refreshToken).toBeUndefined();
   });
 
   it('claudeNodeCredentials refreshes an expired token, writes it back, and strips refresh', async () => {
