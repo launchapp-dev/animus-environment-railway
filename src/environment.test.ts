@@ -1018,6 +1018,55 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.created).toHaveLength(2);
   });
 
+  it('retains a failed post-create rollback across restart until teardown deletes it', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const failingRelay = new RecordingRelay();
+    failingRelay.waitForConnection = async () => {
+      throw new Error('relay connection failed after create');
+    };
+    fake.deleteService = async () => {
+      throw new Error('Railway delete unavailable');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+    };
+    const env = new RailwayEnvironment({ railway: fake, relay: failingRelay, config });
+    live.push({ env, fake });
+
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'failed-connect' } } }),
+    ).rejects.toThrow(/relay connection failed after create/);
+    expect(fake.created).toHaveLength(1);
+
+    // Model a restart while Railway inventory is stale. The durable service-id
+    // reservation must retain the slot even though the failed node is absent
+    // from the listing and the new process has no in-memory record of it.
+    const retainedName = fake.created[0]!.name;
+    fake.listed = [];
+    const restarted = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: restarted, fake });
+    await expect(
+      restarted.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'next-run' } } }),
+    ).rejects.toThrow(/1\/1 managed nodes/);
+    expect(fake.created).toHaveLength(1);
+
+    // Once Railway exposes the retained node, teardown can confirm deletion
+    // and clear the reservation so admission is available again.
+    fake.listed = [{ id: 'svc-1', name: retainedName }];
+    fake.deleteService = FakeRailway.prototype.deleteService.bind(fake);
+    await expect(restarted.teardownNode('svc-1')).resolves.toEqual(['svc-1']);
+    await expect(
+      restarted.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'next-run' } } }),
+    ).resolves.toBeDefined();
+    expect(fake.created).toHaveLength(2);
+  });
+
   it('retains admission after an ambiguous create even when immediate inventory is stale', async () => {
     const fake = new FakeRailway();
     fake.bootBridge = false;

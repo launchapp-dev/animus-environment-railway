@@ -81,7 +81,7 @@ required = false
 
 [[env]]
 key = "ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS"
-description = "Milliseconds to wait under admission for a created service to become visible in Railway inventory (default 30000)."
+description = "Milliseconds to wait under admission for a created service to become visible in Railway inventory before bounded rollback and fail-closed admission (default 30000)."
 required = false
 
 [[env]]

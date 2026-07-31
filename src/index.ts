@@ -84,7 +84,7 @@ const plugin = defineEnvironmentPlugin({
     {
       name: 'ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS',
       description:
-        'Milliseconds to wait under the admission lock for a created service to become visible in Railway inventory (default 30000).',
+        'Milliseconds to wait under the admission lock for a created service to become visible in Railway inventory before bounded rollback and fail-closed admission (default 30000).',
       required: false,
     },
     {

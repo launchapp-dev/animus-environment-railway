@@ -535,11 +535,14 @@ export interface RailwayEnvironmentConfig {
   /** Hard maximum Railway services this client may manage at once. Defaults
    * to five. Zero disables new prepares without affecting teardown/reap. */
   maxManagedNodes?: number;
-  /** Shared local directory for cross-process admission locks. Every plugin
-   * process belonging to one logical client must see the same directory. */
+  /** Shared directory for cross-process admission locks and durable ambiguous-
+   * cleanup reservations. Every plugin process belonging to one logical client
+   * must see the same directory, and production deployments should persist it
+   * across daemon restarts or replacements. */
   capacityLockRoot?: string;
   /** How long admission keeps its cross-process lock while waiting for a new
-   * Railway service to become visible in inventory. */
+   * Railway service to become visible in inventory. Expiry rolls creation back
+   * and fails closed; an ambiguous rollback remains durably reserved. */
   capacityConfirmationTimeoutMs?: number;
 }
 
@@ -1612,10 +1615,21 @@ export class RailwayEnvironment {
       await Promise.resolve(relay.releaseRun(id)).catch(() => undefined);
       this.actorBindings.delete(id);
       if (serviceId) {
-        await this.railway()
+        // Re-establish a durable reservation before rollback. The create was
+        // already confirmed and its admission reservation removed, but a
+        // failed delete is ambiguous: Railway may retain the node while a
+        // restarted plugin observes stale inventory. Keep both the durable and
+        // in-process records until deletion is positively confirmed.
+        const scope = clientServicePrefix(projectId, this.clientId);
+        const reservationPath = await this.writeCapacityReservation(scope, serviceName, serviceId);
+        const deleted = await this.railway()
           .deleteService(serviceId, environmentId)
-          .catch(() => undefined);
-        this.locallyManagedServices.delete(serviceId);
+          .then(() => true)
+          .catch(() => false);
+        if (deleted) {
+          this.locallyManagedServices.delete(serviceId);
+          await rm(reservationPath, { force: true });
+        }
       }
       throw err;
     }
