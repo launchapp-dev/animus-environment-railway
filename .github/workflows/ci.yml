@@ -22,9 +22,57 @@ jobs:
         with:
           node-version: 20
           cache: npm
+      - name: Configure read-only dependency deploy keys
+        shell: bash
+        env:
+          ENVIRONMENT_BASE_DEPLOY_KEY: ${{ secrets.ENVIRONMENT_BASE_DEPLOY_KEY }}
+          ENV_TRANSPORT_DEPLOY_KEY: ${{ secrets.ENV_TRANSPORT_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ENVIRONMENT_BASE_DEPLOY_KEY}" || -z "${ENV_TRANSPORT_DEPLOY_KEY}" ]]; then
+            echo "::error::missing read-only deploy keys for private Animus dependencies"
+            exit 1
+          fi
+
+          install -d -m 0700 "${HOME}/.ssh"
+          printf '%s\n' "${ENVIRONMENT_BASE_DEPLOY_KEY}" > "${HOME}/.ssh/animus_environment_base"
+          printf '%s\n' "${ENV_TRANSPORT_DEPLOY_KEY}" > "${HOME}/.ssh/animus_env_transport"
+          chmod 0600 "${HOME}/.ssh/animus_environment_base" "${HOME}/.ssh/animus_env_transport"
+          ssh-keyscan -t ed25519 github.com > "${HOME}/.ssh/known_hosts"
+          chmod 0600 "${HOME}/.ssh/known_hosts"
+
+          {
+            echo 'Host github.com-animus-environment-base'
+            echo '  HostName github.com'
+            echo '  User git'
+            echo "  IdentityFile ${HOME}/.ssh/animus_environment_base"
+            echo '  IdentitiesOnly yes'
+            echo 'Host github.com-animus-env-transport'
+            echo '  HostName github.com'
+            echo '  User git'
+            echo "  IdentityFile ${HOME}/.ssh/animus_env_transport"
+            echo '  IdentitiesOnly yes'
+          } > "${HOME}/.ssh/config"
+          chmod 0600 "${HOME}/.ssh/config"
+
+          # Longest insteadOf match wins: private dependencies use their own
+          # read-only key, while the public plugin SDK resolves over HTTPS.
+          git config --global url."ssh://git@github.com-animus-environment-base/launchapp-dev/animus-environment-base.git".insteadOf \
+            "ssh://git@github.com/launchapp-dev/animus-environment-base.git"
+          git config --global url."ssh://git@github.com-animus-env-transport/launchapp-dev/animus-env-transport.git".insteadOf \
+            "ssh://git@github.com/launchapp-dev/animus-env-transport.git"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
       - run: npm run bundle
       - run: npm audit
+      - name: Remove dependency deploy keys
+        if: always()
+        shell: bash
+        run: |
+          rm -f \
+            "${HOME}/.ssh/animus_environment_base" \
+            "${HOME}/.ssh/animus_env_transport" \
+            "${HOME}/.ssh/config"
