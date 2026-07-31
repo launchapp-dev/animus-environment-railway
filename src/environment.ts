@@ -592,6 +592,19 @@ const CLAUDE_REFRESH_SKEW_MS = 5 * 60 * 1000;
  *  without any extra portal config. */
 export const DEFAULT_CODEX_OAUTH_HOME = '/data/animus-state/codex-config';
 
+/** Durable dir the portal Connections flow stores Claude subscription auth in. */
+export const DEFAULT_CLAUDE_CONFIG_DIR = '/data/animus-state/claude-config';
+
+/** Resolve the daemon-side Claude config directory. An explicitly empty value
+ * disables subscription credential loading; only an unset value falls back. */
+export function claudeConfigDir(
+  hostEnv: NodeJS.ProcessEnv,
+  defaultDir: string = DEFAULT_CLAUDE_CONFIG_DIR,
+): string | null {
+  const dir = (hostEnv.CLAUDE_CONFIG_DIR ?? defaultDir).trim().replace(/\/$/, '');
+  return dir.length > 0 ? dir : null;
+}
+
 /** Read the daemon-side Codex auth.json + GitHub token and encode them for the
  *  node bootstrap. Claude is handled separately (async central refresh). */
 export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
@@ -626,10 +639,11 @@ export async function claudeNodeCredentials(
   hostEnv: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: typeof fetch = fetch,
+  defaultConfigDir: string = DEFAULT_CLAUDE_CONFIG_DIR,
 ): Promise<Record<string, string>> {
-  const dir = hostEnv.CLAUDE_CONFIG_DIR;
+  const dir = claudeConfigDir(hostEnv, defaultConfigDir);
   if (!dir) return {};
-  const path = `${dir.replace(/\/$/, '')}/.credentials.json`;
+  const path = `${dir}/.credentials.json`;
   let file: Record<string, unknown>;
   let oauth: Record<string, unknown>;
   try {
