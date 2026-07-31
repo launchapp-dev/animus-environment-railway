@@ -1015,6 +1015,12 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/0\/0 managed nodes/);
     expect(fake.created).toHaveLength(0);
     expect(relay.releases).toHaveLength(1);
+
+    // Capacity is an admission-only guard: operators must still be able to
+    // drain existing nodes while new prepares are intentionally disabled.
+    fake.listed = [{ id: 'svc-existing', name: `${SERVICE_NAME_PREFIX}existing` }];
+    await expect(env.teardownNode('svc-existing')).resolves.toEqual(['svc-existing']);
+    expect(fake.deleted).toContainEqual({ serviceId: 'svc-existing', environmentId: 'env-1' });
   });
 
   it('defaults to five and counts restart-visible nodes only for the configured client', async () => {
