@@ -41,10 +41,13 @@ Unit tests mock fetch / the Railway API. To run the gated integration suite
 - `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID`
 - `ANIMUS_ENV_CLIENT_ID` — stable logical owner for restart-safe capacity
   accounting (recommended for multi-client projects)
-- `ANIMUS_ENV_MAX_MANAGED_NODES` — hard per-client node cap (default `5`)
+- `ANIMUS_ENV_MAX_MANAGED_NODES` — hard per-client node cap (default `5`).
+  Setting it to `0` rejects prepares before inventory or same-run
+  reconciliation, preserving existing services while teardown and reap remain
+  available.
 - `ANIMUS_ENV_CAPACITY_LOCK_DIR` — directory shared by all local environment
-  plugin processes for that client; defaults to
-  `/tmp/animus-environment-railway-capacity`
+  plugin processes for that client and persisted across daemon restarts or
+  replacements; defaults to `/tmp/animus-environment-railway-capacity`
 - `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS` — maximum time admission waits
   for a created service to appear in Railway inventory before deleting it and
   failing closed (default `30000`). An ambiguous create or failed rollback is

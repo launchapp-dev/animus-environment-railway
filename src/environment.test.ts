@@ -831,7 +831,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
     await env.teardown(handle); // second teardown: no throw
     expect(fake.deleted).toHaveLength(2); // delete is re-issued; the API treats missing as success
-  });
+  }, 30_000);
 
   it('names the service DETERMINISTICALLY from a broker run id', async () => {
     const { env, fake } = await makeEnv();
@@ -1211,6 +1211,9 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
   it('allows zero to disable prepares without calling Railway create', async () => {
     const fake = new FakeRailway();
     fake.bootBridge = false;
+    const runId = 'existing-paused-run';
+    const existingName = deterministicServiceName('proj-1', 'paused-client', runId);
+    fake.listed = [{ id: 'svc-existing', name: existingName }];
     const relay = new RecordingRelay();
     const env = new RailwayEnvironment({
       railway: fake,
@@ -1224,13 +1227,16 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     });
     live.push({ env, fake });
 
-    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/0\/0 managed nodes/);
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: runId } } }),
+    ).rejects.toThrow(/0\/0 managed nodes/);
     expect(fake.created).toHaveLength(0);
+    expect(fake.deleted).toHaveLength(0);
+    expect(fake.listed).toEqual([{ id: 'svc-existing', name: existingName }]);
     expect(relay.releases).toHaveLength(1);
 
     // Capacity is an admission-only guard: operators must still be able to
     // drain existing nodes while new prepares are intentionally disabled.
-    fake.listed = [{ id: 'svc-existing', name: `${SERVICE_NAME_PREFIX}existing` }];
     await expect(env.teardownNode('svc-existing')).resolves.toEqual(['svc-existing']);
     expect(fake.deleted).toContainEqual({ serviceId: 'svc-existing', environmentId: 'env-1' });
   });

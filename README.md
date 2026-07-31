@@ -49,8 +49,11 @@ Every logical client is limited to five managed Railway nodes by default.
 plugin restarts; it defaults to `ANIMUS_ENV_RELAY_OWNER_ID`, then
 `animus-environment-railway`. Set `ANIMUS_ENV_MAX_MANAGED_NODES` to a
 non-negative integer to change the limit (`0` disables new prepares while
-leaving teardown and reap available). Admission lists Railway first and fails
-closed when capacity cannot be verified. Unknown and legacy `animus-run-*`
+leaving teardown and reap available). The zero-cap check happens before
+inventory or same-run reconciliation, so an admission pause never deletes an
+existing service merely because its run is retried. For positive caps,
+admission lists Railway first and fails closed when capacity cannot be
+verified. Unknown and legacy `animus-run-*`
 services count against the client cap unless their name is structurally
 attributable to a different cap-aware client. A retry carrying the same stable
 run id reconciles its prior service under admission before the cap is checked,
@@ -58,6 +61,9 @@ so replacing that service does not consume an additional slot. A cross-process
 lock under `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
 `/tmp/animus-environment-railway-capacity`) serializes recount-and-create for
 the same project/client; every process for that client must share this path.
+Back the directory with storage that survives daemon restarts or replacements
+so ambiguous-cleanup reservations remain charged until Railway inventory can
+prove that the service is absent.
 The lock remains held until the new service appears in Railway inventory. If
 that confirmation exceeds `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS`
 (default 30 seconds), the plugin deletes the unconfirmed service and fails the

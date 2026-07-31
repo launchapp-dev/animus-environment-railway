@@ -1256,6 +1256,16 @@ export class RailwayEnvironment {
   }): Promise<{ serviceId: string; deploymentId?: string | null }> {
     const admissionScope = JSON.stringify([args.projectId, this.clientId]);
     return this.withAdmissionLock(admissionScope, async () => {
+      // A zero cap is an intentional admission shutdown. Reject before
+      // same-run reconciliation so retrying a known run cannot delete its
+      // existing service while new node creation is disabled.
+      if (this.maxManagedNodes === 0) {
+        throw new Error(
+          `Railway node capacity exhausted for client '${this.clientId}': ` +
+            '0/0 managed nodes; wait for teardown or run `animus environment reap`, or raise ' +
+            'ANIMUS_ENV_MAX_MANAGED_NODES intentionally',
+        );
+      }
       const railway = this.railway();
       const scope = clientServicePrefix(args.projectId, this.clientId);
       const services = await railway.listRunServices(args.projectId);

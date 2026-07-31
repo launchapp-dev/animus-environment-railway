@@ -78,7 +78,7 @@ const plugin = defineEnvironmentPlugin({
     {
       name: 'ANIMUS_ENV_CAPACITY_LOCK_DIR',
       description:
-        'Shared local directory used to serialize node admission across plugin processes (default /tmp/animus-environment-railway-capacity).',
+        'Shared directory used to serialize node admission across plugin processes and persist ambiguous-cleanup reservations across daemon restarts (default /tmp/animus-environment-railway-capacity).',
       required: false,
     },
     {
