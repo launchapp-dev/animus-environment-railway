@@ -143,6 +143,15 @@ tag and rejects any different installed package version before writing release
 assets. Private-repository builders must have GitHub read access when running
 `npm ci`; the published environment binary remains self-contained.
 
+GitHub Actions uses a short-lived installation token from a dedicated GitHub
+App. Configure `ANIMUS_DEPENDENCY_APP_ID` and
+`ANIMUS_DEPENDENCY_APP_PRIVATE_KEY` as repository secrets, install the App on
+only `animus-environment-base` and `animus-env-transport`, and grant it only
+Contents: read. The workflow additionally restricts each minted token to those
+two repositories, removes its temporary Git URL mappings on every exit path,
+and relies on the token action's post-step revocation. Do not substitute a
+personal token or long-lived deploy keys.
+
 ## Develop
 
 ```bash
