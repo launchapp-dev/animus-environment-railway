@@ -49,7 +49,10 @@ Every logical client is limited to five managed Railway nodes by default.
 plugin restarts; it defaults to `ANIMUS_ENV_RELAY_OWNER_ID`, then
 `animus-environment-railway`. Set `ANIMUS_ENV_MAX_MANAGED_NODES` to a
 non-negative integer to change the limit (`0` disables new prepares while
-leaving teardown and reap available). The zero-cap check happens before
+leaving teardown and reap available). Configuration is read when the plugin
+process starts, so restart every replica after changing the limit or client
+identity; mixed old/new settings do not provide one coherent hard cap. The
+zero-cap check happens before
 inventory or same-run reconciliation, so an admission pause never deletes an
 existing service merely because its run is retried. For positive caps,
 admission lists Railway first and fails closed when capacity cannot be
