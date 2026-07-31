@@ -367,6 +367,13 @@ export function deterministicServiceName(projectId: string, clientId: string, ru
   return `${clientServicePrefix(projectId, clientId)}${digest}`;
 }
 
+/** New cap-aware names are the only run-service names that can be safely
+ * attributed to a different logical client. Everything else under the shared
+ * run prefix is legacy/unknown and must be charged conservatively. */
+function isCapAwareServiceName(name: string): boolean {
+  return /^animus-run-[0-9a-f]{8}-(?:[0-9a-f]{10}|r[0-9a-f]{10})$/.test(name);
+}
+
 /** Pre-cap deterministic name retained for cold teardown/reconciliation. */
 function legacyDeterministicServiceName(projectId: string, runId: string): string {
   const digest = createHash('sha256').update(JSON.stringify([projectId, runId])).digest('hex').slice(0, 12);
@@ -1169,11 +1176,10 @@ export class RailwayEnvironment {
           .filter(
             (service) =>
               service.name.startsWith(scope) ||
-              // Pre-cap names do not encode a logical client. Count them
-              // conservatively for every client rather than risk exceeding a
-              // configured safety limit during a rolling upgrade.
-              /^animus-run-[0-9a-f]{12}$/.test(service.name) ||
-              /^animus-run-i[0-9a-f]{6}-/.test(service.name),
+              // Only a valid cap-aware name can be safely assigned to another
+              // client. Count every legacy or unknown run name conservatively
+              // rather than risk exceeding the limit during a rolling upgrade.
+              (service.name.startsWith(SERVICE_NAME_PREFIX) && !isCapAwareServiceName(service.name)),
           )
           .map((service) => service.id),
       );

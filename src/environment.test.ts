@@ -973,6 +973,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     fake.listed = [
       { id: 'legacy-deterministic', name: `${SERVICE_NAME_PREFIX}${'a'.repeat(12)}` },
       { id: 'legacy-random', name: `${SERVICE_NAME_PREFIX}i123abc-r1234567890` },
+      { id: 'legacy-unknown', name: `${SERVICE_NAME_PREFIX}older-format` },
     ];
     const relay = new RecordingRelay();
     const env = new RailwayEnvironment({
@@ -982,12 +983,12 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
         projectId: 'proj-1',
         environmentId: 'env-1',
         clientId: 'portal-production',
-        maxManagedNodes: 2,
+        maxManagedNodes: 3,
       },
     });
     live.push({ env, fake });
 
-    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/2\/2 managed nodes/);
+    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/3\/3 managed nodes/);
     expect(fake.created).toHaveLength(0);
   });
 
@@ -1019,8 +1020,14 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     const ownPrefix = clientServicePrefix('proj-1', clientId);
     const otherPrefix = clientServicePrefix('proj-1', 'another-client');
     fake.listed = [
-      ...Array.from({ length: 5 }, (_, i) => ({ id: `other-${i}`, name: `${otherPrefix}${i}` })),
-      ...Array.from({ length: 5 }, (_, i) => ({ id: `own-${i}`, name: `${ownPrefix}${i}` })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        id: `other-${i}`,
+        name: `${otherPrefix}${i.toString(16).padStart(10, '0')}`,
+      })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        id: `own-${i}`,
+        name: `${ownPrefix}${i.toString(16).padStart(10, '0')}`,
+      })),
     ];
     const relay = new RecordingRelay();
     const env = new RailwayEnvironment({
