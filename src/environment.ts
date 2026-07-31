@@ -554,9 +554,13 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
     relayOwnerId: env.ANIMUS_ENV_RELAY_OWNER_ID,
     relayControlToken: env.ANIMUS_ENV_RELAY_CONTROL_TOKEN,
     clientId: env.ANIMUS_ENV_CLIENT_ID,
-    maxManagedNodes: env.ANIMUS_ENV_MAX_MANAGED_NODES
-      ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
-      : undefined,
+    // Treat blank/whitespace-only configuration as unset. In particular,
+    // Number('   ') is zero, which must not accidentally turn a templated but
+    // empty environment variable into an intentional admission shutdown.
+    maxManagedNodes:
+      env.ANIMUS_ENV_MAX_MANAGED_NODES !== undefined && env.ANIMUS_ENV_MAX_MANAGED_NODES.trim() !== ''
+        ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
+        : undefined,
     capacityLockRoot: env.ANIMUS_ENV_CAPACITY_LOCK_DIR,
     capacityConfirmationTimeoutMs: env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS
       ? Number(env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS)
