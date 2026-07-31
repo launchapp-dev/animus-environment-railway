@@ -113,7 +113,7 @@ installation, so a clean checkout needs no mutable sibling worktrees. The
 binary, and the release asset carries no Git or `file:../` dependency.
 
 The bundle is deliberately fail-closed on the transport boundary: this source
-release pins `@launchapp-dev/animus-env-transport` to the immutable `v0.3.3` Git
+release pins `@launchapp-dev/animus-env-transport` to the immutable `v0.3.4` Git
 tag and rejects any different installed package version before writing release
 assets. Private-repository builders must have GitHub read access when running
 `npm ci`; the published environment binary remains self-contained.
