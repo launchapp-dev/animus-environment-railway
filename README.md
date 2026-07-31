@@ -57,13 +57,27 @@ verified. Unknown and legacy `animus-run-*`
 services count against the client cap unless their name is structurally
 attributable to a different cap-aware client. A retry carrying the same stable
 run id reconciles its prior service under admission before the cap is checked,
-so replacing that service does not consume an additional slot. A cross-process
-lock under `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
+so replacing that service does not consume an additional slot. A distributed
+directory lease under `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
 `/tmp/animus-environment-railway-capacity`) serializes recount-and-create for
-the same project/client; every process for that client must share this path.
+the same project/client; every process and host for that client must share this
+path. The lease is heartbeated while held and recovered after an owner crash.
 Back the directory with storage that survives daemon restarts or replacements
 so ambiguous-cleanup reservations remain charged until Railway inventory can
 prove that the service is absent.
+Treat `ANIMUS_ENV_CLIENT_ID` as persistent deployment identity: changing it
+creates a new cap-aware namespace, while legacy or otherwise unattributable
+`animus-run-*` services continue to be counted conservatively. In a replicated
+deployment, mount the same persistent POSIX filesystem at
+`ANIMUS_ENV_CAPACITY_LOCK_DIR` in every replica. The lock algorithm requires
+atomic hard-link creation (`link(2)`, with an existing destination reported as
+`EEXIST`) for admission compare-and-set, atomic same-filesystem `rename(2)`, and
+cross-host coherent file contents, `stat`/mtime updates, and `utimes` heartbeat
+updates. The lock files, private candidate links, and `reservations/` directory
+must all remain on that one filesystem/mount. Replica-local `/tmp`, object
+storage, and object-backed/FUSE volumes that do not explicitly provide those
+semantics cannot provide cross-host admission serialization or restart
+recovery and must not be used for the production hard cap.
 The lock remains held until the new service appears in Railway inventory. If
 that confirmation exceeds `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS`
 (default 30 seconds), the plugin deletes the unconfirmed service and fails the

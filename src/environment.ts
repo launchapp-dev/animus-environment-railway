@@ -21,8 +21,7 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { createConnection, createServer, type Server } from 'node:net';
+import { link, mkdir, readdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -353,7 +352,12 @@ const DEFAULT_CLIENT_ID = 'animus-environment-railway';
 export const DEFAULT_MAX_MANAGED_NODES = 5;
 export const DEFAULT_CAPACITY_LOCK_ROOT = '/tmp/animus-environment-railway-capacity';
 export const DEFAULT_CAPACITY_CONFIRMATION_TIMEOUT_MS = 30_000;
-const CAPACITY_LOCK_WAIT_MS = 90_000;
+const CAPACITY_LOCK_STALE_MS = 120_000;
+const CAPACITY_LOCK_HEARTBEAT_MS = 10_000;
+// A contender must remain alive long enough to recover a lease whose owner
+// crashed immediately after acquiring it. Include one heartbeat interval as
+// scheduling slack beyond the stale threshold.
+const CAPACITY_LOCK_WAIT_MS = CAPACITY_LOCK_STALE_MS + CAPACITY_LOCK_HEARTBEAT_MS;
 const CAPACITY_VISIBILITY_POLL_MS = 100;
 
 /** Stable service prefix for one logical plugin client. The fingerprint keeps
@@ -1021,79 +1025,127 @@ export class RailwayEnvironment {
     );
   }
 
-  private async capacitySocketIsActive(socketPath: string): Promise<boolean> {
-    return new Promise<boolean>((resolve, reject) => {
-      const socket = createConnection(socketPath);
-      let settled = false;
-      const finish = (active: boolean): void => {
-        if (settled) return;
-        settled = true;
-        socket.destroy();
-        resolve(active);
-      };
-      socket.once('connect', () => finish(true));
-      socket.once('error', (error: NodeJS.ErrnoException) => {
-        if (error.code === 'ECONNREFUSED' || error.code === 'ENOENT') {
-          finish(false);
-          return;
-        }
-        if (settled) return;
-        settled = true;
-        socket.destroy();
-        reject(error);
-      });
-    });
-  }
-
-  private async tryListenCapacitySocket(socketPath: string): Promise<Server | null> {
-    return new Promise<Server | null>((resolve, reject) => {
-      const server = createServer((socket) => socket.destroy());
-      const onError = (error: NodeJS.ErrnoException): void => {
-        server.removeAllListeners();
-        if (error.code === 'EADDRINUSE') {
-          resolve(null);
-          return;
-        }
-        reject(error);
-      };
-      server.once('error', onError);
-      server.listen(socketPath, () => {
-        server.off('error', onError);
-        resolve(server);
-      });
-    });
-  }
-
-  private async acquireCapacityLock(scope: string): Promise<() => Promise<void>> {
+  private async acquireCapacityLock(
+    scope: string,
+    serviceName?: string,
+  ): Promise<{ ownerToken: string; release: () => Promise<void> }> {
     const root = this.config.capacityLockRoot?.trim() || DEFAULT_CAPACITY_LOCK_ROOT;
-    // Linux abstract sockets are owned entirely by the kernel: they are
-    // exclusive across processes and disappear atomically on process death,
-    // so no stale pathname can race with a replacement owner. macOS/BSD use a
-    // compact filesystem socket for local development and tests.
+    // link is the admission compare-and-set: the candidate file already holds
+    // the complete create intent before it can become the shared lease. If a
+    // paused owner is reclaimed, that exact file is moved to reservations, so
+    // the owner may resume and create but no successor can spend its slot too.
+    await mkdir(root, { recursive: true });
     const lockId = createHash('sha256').update(JSON.stringify([root, scope])).digest('hex').slice(0, 24);
-    const filesystemSocket = process.platform !== 'linux';
-    if (filesystemSocket) await mkdir(root, { recursive: true });
-    const socketPath = filesystemSocket ? join(root, `${lockId}.sock`) : `\0animus-env-cap-${lockId}`;
+    const lockPath = join(root, `${lockId}.lock`);
     const deadline = Date.now() + CAPACITY_LOCK_WAIT_MS;
 
     while (true) {
-      const server = await this.tryListenCapacitySocket(socketPath);
-      if (server) {
-        return async () => {
-          await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
-          if (filesystemSocket) await rm(socketPath, { force: true }).catch(() => undefined);
+      const ownerToken = randomBytes(16).toString('hex');
+      const candidatePath = join(root, `.${lockId}.${ownerToken}.candidate`);
+      try {
+        await writeFile(candidatePath, JSON.stringify({ ownerToken, serviceName }), {
+          encoding: 'utf8',
+          flag: 'wx',
+          mode: 0o600,
+        });
+        await link(candidatePath, lockPath);
+        // Keep the private hard link for the lifetime of the lease. Heartbeat
+        // this inode, not the public pathname: after stale recovery the public
+        // name may already belong to a successor.
+        const heartbeat = setInterval(() => {
+          const now = new Date();
+          void utimes(candidatePath, now, now).catch(() => undefined);
+        }, CAPACITY_LOCK_HEARTBEAT_MS);
+        heartbeat.unref();
+        const release = async (): Promise<void> => {
+          clearInterval(heartbeat);
+          const releaseDir = this.capacityReservationDir(scope);
+          const releasedPath = join(releaseDir, `released-${ownerToken}.json`);
+          try {
+            await mkdir(releaseDir, { recursive: true });
+            // Rename first, then inspect. This atomically detaches one exact
+            // lease generation, avoiding a read-token/unlink TOCTOU that could
+            // otherwise delete a successor's lock. If it is a successor, its
+            // create intent remains a conservative durable reservation.
+            await rename(lockPath, releasedPath);
+            const releasedOwner = await readFile(releasedPath, 'utf8')
+              .then((value) => (JSON.parse(value) as { ownerToken?: unknown }).ownerToken)
+              .catch(() => undefined);
+            if (releasedOwner === ownerToken) {
+              await rm(releasedPath, { force: true });
+            } else {
+              // Put a successor back without overwriting any newer contender.
+              // If the public name was claimed during this small window, keep
+              // the displaced successor as a reservation instead; its intent
+              // must never be discarded.
+              try {
+                await link(releasedPath, lockPath);
+                await rm(releasedPath, { force: true });
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+              }
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          } finally {
+            await rm(candidatePath, { force: true }).catch(() => undefined);
+          }
         };
+        return { ownerToken, release };
+      } catch (error) {
+        await rm(candidatePath, { force: true }).catch(() => undefined);
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       }
 
-      // A crashed process leaves only a dead socket pathname. Probe before
-      // removing it so a slow/old owner can never have its live lock stolen.
-      if (!(await this.capacitySocketIsActive(socketPath))) {
-        if (filesystemSocket) {
-          await rm(socketPath, { force: true }).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== 'ENOENT') throw error;
-          });
+      try {
+        const lease = await stat(lockPath);
+        if (Date.now() - lease.mtimeMs > CAPACITY_LOCK_STALE_MS) {
+          const staleToken = randomBytes(8).toString('hex');
+          const reservationDir = this.capacityReservationDir(scope);
+          const reclaimedPath = join(reservationDir, `reclaimed-${staleToken}.json`);
+          try {
+            await mkdir(reservationDir, { recursive: true });
+            // Publish the detached generation directly as a counted
+            // reservation. rename is atomic on this shared filesystem, so an
+            // observer can never see the create intent as neither the public
+            // lock nor a reservation. If another reclaimer replaced the
+            // generation after our stat, retaining that newer intent is
+            // conservative but still cap-safe.
+            await rename(lockPath, reclaimedPath);
+            const staleOwner = await readFile(reclaimedPath, 'utf8')
+              .then((value) => JSON.parse(value) as { ownerToken?: unknown; serviceName?: unknown })
+              .catch(() => ({}));
+            const staleOwnerToken =
+              typeof staleOwner.ownerToken === 'string' ? staleOwner.ownerToken : undefined;
+            const staleServiceName =
+              typeof staleOwner.serviceName === 'string' ? staleOwner.serviceName : undefined;
+            const reclaimed = await stat(reclaimedPath);
+            if (
+              reclaimed.dev === lease.dev &&
+              reclaimed.ino === lease.ino &&
+              staleOwnerToken !== undefined &&
+              /^[0-9a-f]{32}$/.test(staleOwnerToken)
+            ) {
+              // The reservation is now durable, so the crashed generation's
+              // private hard link is no longer needed. Validate the inode
+              // first: lockPath may have been replaced after our initial stat,
+              // and a successor's candidate must never be removed.
+              const staleCandidatePath = join(root, `.${lockId}.${staleOwnerToken}.candidate`);
+              await rm(staleCandidatePath, { force: true });
+            }
+            // Cleanup operations have no create intent and need no retained
+            // slot. A reclaimed admission lease remains until inventory or an
+            // explicit lifecycle cleanup proves its named service absent.
+            if (!staleServiceName) await rm(reclaimedPath, { force: true });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+          continue;
         }
-        continue;
+      } catch (error) {
+        // Another contender may have reclaimed the lease. That does not
+        // permit bypassing the link gate.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
       if (Date.now() >= deadline) {
         throw new Error(
@@ -1112,7 +1164,7 @@ export class RailwayEnvironment {
   }
 
   private async readCapacityReservations(scope: string): Promise<
-    Array<{ path: string; serviceId?: string; serviceName?: string }>
+    Array<{ path: string; ownerToken?: string; serviceId?: string; serviceName?: string }>
   > {
     const dir = this.capacityReservationDir(scope);
     let names: string[];
@@ -1127,11 +1179,13 @@ export class RailwayEnvironment {
         const path = join(dir, name);
         try {
           const value = JSON.parse(await readFile(path, 'utf8')) as {
+            ownerToken?: unknown;
             serviceId?: unknown;
             serviceName?: unknown;
           };
           return {
             path,
+            ownerToken: typeof value.ownerToken === 'string' ? value.ownerToken : undefined,
             serviceId: typeof value.serviceId === 'string' ? value.serviceId : undefined,
             serviceName: typeof value.serviceName === 'string' ? value.serviceName : undefined,
           };
@@ -1148,11 +1202,19 @@ export class RailwayEnvironment {
     scope: string,
     serviceName: string,
     serviceId?: string,
+    reclaimedPath?: string,
   ): Promise<string> {
     const dir = this.capacityReservationDir(scope);
     await mkdir(dir, { recursive: true });
     const reservationId = createHash('sha256').update(serviceName).digest('hex').slice(0, 24);
     const path = join(dir, `${reservationId}.json`);
+    if (reclaimedPath !== undefined) {
+      // The stale owner's published intent already owns this capacity slot.
+      // Move that exact reservation to the normal deterministic pathname so
+      // there is no instant when a successor can observe the slot as free.
+      await rename(reclaimedPath, path);
+      return path;
+    }
     await writeFile(path, JSON.stringify({ serviceName, serviceId }), { mode: 0o600 });
     return path;
   }
@@ -1197,23 +1259,27 @@ export class RailwayEnvironment {
     }
   }
 
-  private async withAdmissionLock<T>(scope: string, operation: () => Promise<T>): Promise<T> {
+  private async withAdmissionLock<T>(
+    scope: string,
+    operation: (ownerToken: string) => Promise<T>,
+    serviceName?: string,
+  ): Promise<T> {
     const previous = this.admissionTail;
     let release!: () => void;
     this.admissionTail = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous;
-    let releaseFileLock: (() => Promise<void>) | undefined;
+    let lease: { ownerToken: string; release: () => Promise<void> } | undefined;
     try {
-      releaseFileLock = await this.acquireCapacityLock(scope);
-      return await operation();
+      lease = await this.acquireCapacityLock(scope, serviceName);
+      return await operation(lease.ownerToken);
     } finally {
       // Always advance the in-process queue, even if releasing the
       // cross-process lock fails. Otherwise one cleanup error permanently
       // strands every later prepare behind an unresolved admissionTail.
       try {
-        await releaseFileLock?.();
+        await lease?.release();
       } finally {
         release();
       }
@@ -1257,8 +1323,11 @@ export class RailwayEnvironment {
     image: string;
     variables: Record<string, string>;
   }): Promise<{ serviceId: string; deploymentId?: string | null }> {
-    const admissionScope = JSON.stringify([args.projectId, this.clientId]);
-    return this.withAdmissionLock(admissionScope, async () => {
+    // Use the managed-service scope for both the lock key and its durable
+    // reservations. A reclaimed lease must land in the same directory that
+    // capacity reconciliation counts after the successor acquires the lock.
+    const admissionScope = clientServicePrefix(args.projectId, this.clientId);
+    return this.withAdmissionLock(admissionScope, async (ownerToken) => {
       // A zero cap is an intentional admission shutdown. Reject before
       // same-run reconciliation so retrying a known run cannot delete its
       // existing service while new node creation is disabled.
@@ -1292,6 +1361,9 @@ export class RailwayEnvironment {
       }
 
       const reservations = await this.readCapacityReservations(scope);
+      const reclaimedReservation = reservations.find(
+        (reservation) => reservation.ownerToken === ownerToken && reservation.serviceName === args.serviceName,
+      );
       const remainingReservations: typeof reservations = [];
       for (const reservation of reservations) {
         const visible = services.some(
@@ -1302,7 +1374,7 @@ export class RailwayEnvironment {
         if (visible) {
           // Railway inventory is authoritative now and will be counted below.
           await rm(reservation.path, { force: true });
-        } else {
+        } else if (reservation !== reclaimedReservation) {
           remainingReservations.push(reservation);
         }
       }
@@ -1348,7 +1420,12 @@ export class RailwayEnvironment {
       // Persist intent before asking Railway to create. If this process dies or
       // receives an ambiguous response, another process must conservatively
       // retain the slot until inventory verifies the service.
-      const reservationPath = await this.writeCapacityReservation(scope, args.serviceName);
+      const reservationPath = await this.writeCapacityReservation(
+        scope,
+        args.serviceName,
+        undefined,
+        reclaimedReservation?.path,
+      );
       let created: CreatedService;
       try {
         created = await railway.createRunService({
@@ -1408,7 +1485,7 @@ export class RailwayEnvironment {
         throw confirmationError;
       }
       return created;
-    });
+    }, args.serviceName);
   }
 
   /** Lazily spawn the parent-side backend plugin a node's `backend/call` is
@@ -1808,7 +1885,7 @@ export class RailwayEnvironment {
       deterministicServiceName(projectId, this.clientId, runId),
       legacyDeterministicServiceName(projectId, runId),
     ]);
-    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    const admissionScope = clientServicePrefix(projectId, this.clientId);
     await this.withAdmissionLock(admissionScope, async () => {
       const scope = clientServicePrefix(projectId, this.clientId);
       const match = (await this.railway().listRunServices(projectId)).find((s) => serviceNames.has(s.name));
@@ -1840,7 +1917,7 @@ export class RailwayEnvironment {
     if (!target) throw new Error('gcOrphans needs a project id (RAILWAY_PROJECT_ID or argument)');
     const environmentId = opts.environmentId ?? this.config.environmentId;
     if (!environmentId) throw new Error('gcOrphans needs an environment id (RAILWAY_ENVIRONMENT_ID or argument)');
-    const admissionScope = JSON.stringify([target, this.clientId]);
+    const admissionScope = clientServicePrefix(target, this.clientId);
     return this.withAdmissionLock(admissionScope, async () => {
       const services = await this.railway().listRunServices(target);
       const clientPrefix = clientServicePrefix(target, this.clientId);
@@ -1892,7 +1969,7 @@ export class RailwayEnvironment {
     // service name, OR a bare animus run id — resolving the run id to its
     // deterministic service name so a daemon that persisted only the run id can
     // drive teardown after losing the in-memory handle (TASK-797/TASK-933).
-    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    const admissionScope = clientServicePrefix(projectId, this.clientId);
     return this.withAdmissionLock(admissionScope, async () => {
       const scope = clientServicePrefix(projectId, this.clientId);
       const byRunName = deterministicServiceName(projectId, this.clientId, idOrName);
@@ -1951,7 +2028,7 @@ export class RailwayEnvironment {
     const environmentId = this.config.environmentId;
     if (!projectId) throw new Error('reap needs a project id (RAILWAY_PROJECT_ID)');
     if (!environmentId) throw new Error('reap needs an environment id (RAILWAY_ENVIRONMENT_ID)');
-    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    const admissionScope = clientServicePrefix(projectId, this.clientId);
     return this.withAdmissionLock(admissionScope, async () => {
       const nodes = await this.describeNodes(projectId);
       // Protected set = names of runs KNOWN to be live. Two authoritative sources,

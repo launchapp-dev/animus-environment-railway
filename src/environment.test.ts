@@ -9,12 +9,20 @@
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
 import { createHash, generateKeyPairSync } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { BridgeClient, RelayServer, type ExecutionFence } from '@launchapp-dev/animus-env-transport';
 import {
@@ -884,7 +892,7 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.created).toHaveLength(3);
   });
 
-  it('serializes capacity across separate plugin instances for one logical client', async () => {
+  it('serializes isolated-host admission through only the shared lock volume', async () => {
     const fake = new FakeRailway();
     fake.bootBridge = false;
     fake.trackCreatedServices = true;
@@ -898,8 +906,18 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
       maxManagedNodes: 1,
       capacityLockRoot,
     };
-    const envA = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
-    const envB = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    // These instances have independent in-process queues, as replicas on
+    // isolated hosts would. The shared filesystem lease is their only lock.
+    const envA = new RailwayEnvironment({
+      railway: fake,
+      relay: new RecordingRelay(),
+      config: { ...config },
+    });
+    const envB = new RailwayEnvironment({
+      railway: fake,
+      relay: new RecordingRelay(),
+      config: { ...config },
+    });
     live.push({ env: envA, fake }, { env: envB, fake });
 
     const results = await Promise.allSettled([
@@ -947,6 +965,127 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
       reason: expect.objectContaining({ message: expect.stringMatching(/1\/1 managed nodes/) }),
     });
     expect(fake.created).toHaveLength(1);
+  });
+
+  it('atomically publishes a paused stale owner as a counted reservation at cap one', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.trackCreatedServices = true;
+    let releasePausedList!: () => void;
+    const pausedList = new Promise<void>((resolve) => { releasePausedList = resolve; });
+    let signalListStarted!: () => void;
+    const listStarted = new Promise<void>((resolve) => { signalListStarted = resolve; });
+    let firstList = true;
+    fake.listRunServices = async () => {
+      if (firstList) {
+        firstList = false;
+        signalListStarted();
+        await pausedList;
+      }
+      return fake.listed;
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+      capacityConfirmationTimeoutMs: 1_000,
+    };
+    const envA = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    const envB = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: envA, fake }, { env: envB, fake });
+
+    const owner = envA.prepare({
+      spec: { kind: 'railway', metadata: { animus_run_id: 'paused-owner' } },
+    });
+    await listStarted;
+    const lockName = readdirSync(capacityLockRoot).find((name) => name.endsWith('.lock'));
+    expect(lockName).toBeDefined();
+    const stale = new Date(Date.now() - 180_000);
+    utimesSync(join(capacityLockRoot, lockName!), stale, stale);
+
+    await expect(
+      envB.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'successor' } } }),
+    ).rejects.toThrow(/1\/1 managed nodes/);
+    expect(fake.created).toHaveLength(0);
+    const reservationScope = clientServicePrefix('proj-1', 'portal-production');
+    const reservationScopeId = createHash('sha256').update(reservationScope).digest('hex').slice(0, 24);
+    expect(readdirSync(join(capacityLockRoot, 'reservations', reservationScopeId))).toHaveLength(1);
+
+    releasePausedList();
+    await expect(owner).resolves.toBeDefined();
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it("does not release a successor's lease after stale-owner recovery", async () => {
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 2,
+      capacityLockRoot,
+    };
+    const envA = new RailwayEnvironment({ railway: new FakeRailway(), config });
+    const envB = new RailwayEnvironment({ railway: new FakeRailway(), config });
+    const scope = JSON.stringify(['proj-1', 'portal-production']);
+    type LockAccess = {
+      acquireCapacityLock(
+        scope: string,
+        serviceName?: string,
+      ): Promise<{ ownerToken: string; release: () => Promise<void> }>;
+    };
+
+    const releaseA = await (envA as unknown as LockAccess).acquireCapacityLock(scope, 'owner-service');
+    const lockName = readdirSync(capacityLockRoot).find((name) => name.endsWith('.lock'))!;
+    const stale = new Date(Date.now() - 180_000);
+    utimesSync(join(capacityLockRoot, lockName), stale, stale);
+    const releaseB = await (envB as unknown as LockAccess).acquireCapacityLock(scope, 'successor-service');
+
+    await releaseA.release();
+    expect(existsSync(join(capacityLockRoot, lockName))).toBe(true);
+    await releaseB.release();
+    expect(existsSync(join(capacityLockRoot, lockName))).toBe(false);
+  });
+
+  it('recovers a freshly crashed lease within the same acquisition attempt', async () => {
+    vi.useFakeTimers();
+    type LockAccess = {
+      acquireCapacityLock(
+        scope: string,
+        serviceName?: string,
+      ): Promise<{ ownerToken: string; release: () => Promise<void> }>;
+    };
+    let successor: Awaited<ReturnType<LockAccess['acquireCapacityLock']>> | undefined;
+    try {
+      const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+      const config = {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        clientId: 'portal-production',
+        maxManagedNodes: 2,
+        capacityLockRoot,
+      };
+      const envA = new RailwayEnvironment({ railway: new FakeRailway(), config });
+      const envB = new RailwayEnvironment({ railway: new FakeRailway(), config });
+      const scope = clientServicePrefix('proj-1', 'portal-production');
+
+      await (envA as unknown as LockAccess).acquireCapacityLock(scope, 'crashed-service');
+      // Model a process crash: its heartbeat disappears without running release.
+      vi.clearAllTimers();
+      const successorPromise = (envB as unknown as LockAccess).acquireCapacityLock(scope, 'successor-service');
+      await vi.advanceTimersByTimeAsync(121_000);
+      successor = await successorPromise;
+
+      const candidates = readdirSync(capacityLockRoot).filter((name) => name.endsWith('.candidate'));
+      expect(candidates).toHaveLength(1);
+      expect(readFileSync(join(capacityLockRoot, candidates[0]!), 'utf8')).toContain(successor.ownerToken);
+    } finally {
+      await successor?.release();
+      vi.useRealTimers();
+    }
   });
 
   it('deletes an unconfirmed create before releasing cross-process admission', async () => {
