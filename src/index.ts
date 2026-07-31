@@ -64,6 +64,24 @@ const plugin = defineEnvironmentPlugin({
       required: false,
     },
     {
+      name: 'ANIMUS_ENV_CLIENT_ID',
+      description:
+        'Stable logical client id for restart-safe Railway node capacity accounting (defaults to ANIMUS_ENV_RELAY_OWNER_ID, then animus-environment-railway).',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_MAX_MANAGED_NODES',
+      description:
+        'Hard per-client Railway node limit (default 5; zero disables new node creation while preserving teardown/reap).',
+      required: false,
+    },
+    {
+      name: 'ANIMUS_ENV_CAPACITY_LOCK_DIR',
+      description:
+        'Shared local directory used to serialize node admission across plugin processes (default /tmp/animus-environment-railway-capacity).',
+      required: false,
+    },
+    {
       name: 'ANIMUS_ENV_RELAY_SOCK',
       description: 'Local unix socket exposed by the singleton relay (default /tmp/animus-env-relay.sock).',
       required: false,

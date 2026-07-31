@@ -16,6 +16,7 @@ socket.
 ## Flow
 
 1. **prepare(spec)** — start/reuse the relay listener, mint a per-run token,
+   enforce the client's hard managed-node limit (default 5),
    create a Railway service from the base image (default
    `ghcr.io/launchapp-dev/animus:v0.7.0-rc.2`, override via `spec.image` /
    `ANIMUS_ENV_RAILWAY_IMAGE`) via the Railway GraphQL v2 API
@@ -42,6 +43,18 @@ See `plugin.toml` for the full env surface. Minimum for real runs:
 `ANIMUS_ENV_RELAY_PUBLIC_URL` (a `wss://` URL reachable from Railway that
 routes to this plugin's relay port). Per-run overrides:
 `spec.metadata.railway_project_id` / `railway_environment_id`.
+
+Every logical client is limited to five managed Railway nodes by default.
+`ANIMUS_ENV_CLIENT_ID` gives the client a stable capacity identity across
+plugin restarts; it defaults to `ANIMUS_ENV_RELAY_OWNER_ID`, then
+`animus-environment-railway`. Set `ANIMUS_ENV_MAX_MANAGED_NODES` to a
+non-negative integer to change the limit (`0` disables new prepares while
+leaving teardown and reap available). Admission lists Railway first and fails
+closed when capacity cannot be verified. A cross-process lock under
+`ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
+`/tmp/animus-environment-railway-capacity`) serializes recount-and-create for
+the same project/client; every process for that client must share this path.
+Service names contain only a hash of the client id.
 
 `exec_session` actor authority is bound at prepare time. The plugin injects
 only the SDK-authenticated actor as `ANIMUS_ACTOR_JSON`, signs the persisted

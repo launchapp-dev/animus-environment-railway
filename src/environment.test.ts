@@ -26,10 +26,13 @@ import {
 import {
   claudeNodeCredentials,
   cloneCommands,
+  clientServicePrefix,
   configFromEnv,
   DEFAULT_BRIDGE_COMMAND,
   DEFAULT_CODEX_OAUTH_HOME,
   DEFAULT_IMAGE,
+  DEFAULT_MAX_MANAGED_NODES,
+  deterministicServiceName,
   githubAppCredentials,
   harnessCredentialVars,
   logStorageEnv,
@@ -62,6 +65,10 @@ class FakeRailway implements RailwayApi {
   listed: Array<{ id: string; name: string }> = [];
   /** Set false to simulate a service that never dials home. */
   bootBridge = true;
+  /** Model Railway's restart-visible service inventory for multi-client tests. */
+  trackCreatedServices = false;
+  /** Hold creation open to exercise cross-process admission races. */
+  createDelayMs = 0;
   private readonly bridges: BridgeClient[] = [];
   private seq = 0;
 
@@ -69,6 +76,10 @@ class FakeRailway implements RailwayApi {
     this.created.push(input);
     this.seq += 1;
     const serviceId = `svc-${this.seq}`;
+    if (this.createDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.createDelayMs));
+    }
+    if (this.trackCreatedServices) this.listed.push({ id: serviceId, name: input.name });
     if (this.bootBridge) {
       const url = input.variables.ANIMUS_ENV_WSS_URL;
       const token = input.variables.ANIMUS_ENV_RUN_TOKEN;
@@ -85,6 +96,7 @@ class FakeRailway implements RailwayApi {
 
   async deleteService(serviceId: string, environmentId: string): Promise<void> {
     this.deleted.push({ serviceId, environmentId });
+    if (this.trackCreatedServices) this.listed = this.listed.filter((service) => service.id !== serviceId);
   }
 
   async listRunServices(): Promise<Array<{ id: string; name: string }>> {
@@ -667,6 +679,8 @@ describe('pure helpers', () => {
       ANIMUS_ENV_RELAY_PUBLIC_URL: 'wss://daemon.example.com',
       ANIMUS_ENV_RELAY_PORT: '8790',
       ANIMUS_ENV_DIAL_TIMEOUT_SECS: '60',
+      ANIMUS_ENV_CLIENT_ID: 'portal-production',
+      ANIMUS_ENV_MAX_MANAGED_NODES: '7',
     } as NodeJS.ProcessEnv);
     expect(config).toMatchObject({
       projectId: 'p',
@@ -674,7 +688,10 @@ describe('pure helpers', () => {
       relayPublicUrl: 'wss://daemon.example.com',
       relayPort: 8790,
       dialTimeoutSecs: 60,
+      clientId: 'portal-production',
+      maxManagedNodes: 7,
     });
+    expect(DEFAULT_MAX_MANAGED_NODES).toBe(5);
     expect(configFromEnv({ RAILWAY_TOKEN: 'railway-secret' } as NodeJS.ProcessEnv).actorBindingSecret).toBe(
       'railway-secret',
     );
@@ -684,6 +701,13 @@ describe('pure helpers', () => {
         ANIMUS_ENV_ACTOR_BINDING_SECRET: 'dedicated-secret',
       } as NodeJS.ProcessEnv).actorBindingSecret,
     ).toBe('dedicated-secret');
+    expect(
+      () =>
+        new RailwayEnvironment({
+          railway: new FakeRailway(),
+          config: { maxManagedNodes: 1.5 },
+        }),
+    ).toThrow(/non-negative integer/);
   });
 });
 
@@ -698,7 +722,9 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(meta.service_id).toBe('svc-1');
     expect(meta.project_id).toBe('proj-1');
     expect(meta.environment_id).toBe('env-1');
-    expect(String(meta.service_name)).toBe(`${SERVICE_NAME_PREFIX}${env.instanceId}-${handle.id.slice(0, 11)}`);
+    expect(String(meta.service_name)).toBe(
+      `${clientServicePrefix('proj-1', 'animus-environment-railway')}${handle.id.slice(0, 11)}`,
+    );
 
     // The service was created from the default image with the bridge command
     // and the injected relay coordinates + spec env.
@@ -748,12 +774,209 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
   it('names the service DETERMINISTICALLY from a broker run id', async () => {
     const { env, fake } = await makeEnv();
     const runId = 'run-abc-123';
-    const expected = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', runId])).digest('hex').slice(0, 12);
+    const expected = deterministicServiceName('proj-1', 'animus-environment-railway', runId);
     const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: runId } } });
     expect(fake.created[0].name).toBe(expected);
-    expect(expected.length).toBeLessThanOrEqual(26);
+    expect(expected.length).toBeLessThanOrEqual(32);
     expect((handle.metadata as Record<string, unknown>).animus_run_id).toBe(runId);
     await env.teardown(handle);
+  });
+
+  it('enforces the configurable node cap across concurrent prepares for one client', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        clientId: 'portal-production',
+        maxManagedNodes: 2,
+      },
+    });
+    live.push({ env, fake });
+
+    const results = await Promise.allSettled([
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-cap-1' } } }),
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-cap-2' } } }),
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-cap-3' } } }),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(2);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ message: expect.stringMatching(/2\/2 managed nodes/) }),
+    });
+    expect(fake.created).toHaveLength(2);
+    expect(relay.releases).toHaveLength(1);
+
+    const first = results.find((result) => result.status === 'fulfilled');
+    if (!first || first.status !== 'fulfilled') throw new Error('expected a fulfilled prepare');
+    await env.teardown(first.value.handle);
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-cap-4' } } }),
+    ).resolves.toBeDefined();
+    expect(fake.created).toHaveLength(3);
+  });
+
+  it('serializes capacity across separate plugin instances for one logical client', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.trackCreatedServices = true;
+    fake.createDelayMs = 75;
+    // Keep the literal path short enough for macOS's Unix-socket path limit.
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+    };
+    const envA = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    const envB = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: envA, fake }, { env: envB, fake });
+
+    const results = await Promise.allSettled([
+      envA.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-process-a' } } }),
+      envB.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-process-b' } } }),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const rejected = results.find((result) => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ message: expect.stringMatching(/1\/1 managed nodes/) }),
+    });
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it('conservatively counts unscoped pre-cap names against a configured client', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.listed = [
+      { id: 'legacy-deterministic', name: `${SERVICE_NAME_PREFIX}${'a'.repeat(12)}` },
+      { id: 'legacy-random', name: `${SERVICE_NAME_PREFIX}i123abc-r1234567890` },
+    ];
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        clientId: 'portal-production',
+        maxManagedNodes: 2,
+      },
+    });
+    live.push({ env, fake });
+
+    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/2\/2 managed nodes/);
+    expect(fake.created).toHaveLength(0);
+  });
+
+  it('allows zero to disable prepares without calling Railway create', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        clientId: 'paused-client',
+        maxManagedNodes: 0,
+      },
+    });
+    live.push({ env, fake });
+
+    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/0\/0 managed nodes/);
+    expect(fake.created).toHaveLength(0);
+    expect(relay.releases).toHaveLength(1);
+  });
+
+  it('defaults to five and counts restart-visible nodes only for the configured client', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const clientId = 'portal-production';
+    const ownPrefix = clientServicePrefix('proj-1', clientId);
+    const otherPrefix = clientServicePrefix('proj-1', 'another-client');
+    fake.listed = [
+      ...Array.from({ length: 5 }, (_, i) => ({ id: `other-${i}`, name: `${otherPrefix}${i}` })),
+      ...Array.from({ length: 5 }, (_, i) => ({ id: `own-${i}`, name: `${ownPrefix}${i}` })),
+    ];
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: { projectId: 'proj-1', environmentId: 'env-1', clientId },
+    });
+    live.push({ env, fake });
+
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-over-cap' } } }),
+    ).rejects.toThrow(/5\/5 managed nodes/);
+    expect(fake.created).toHaveLength(0);
+
+    // Another client in the same Railway project does not consume this
+    // client's slots once the five own nodes are removed from the listing.
+    fake.listed = fake.listed.filter((service) => service.name.startsWith(otherPrefix));
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-own-slot' } } }),
+    ).resolves.toBeDefined();
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it('reconciles a same-run service inside the cap instead of rejecting the retry', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const clientId = 'portal-production';
+    const runId = 'run-retry';
+    fake.listed = [
+      { id: 'svc-old', name: deterministicServiceName('proj-1', clientId, runId) },
+    ];
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        clientId,
+        maxManagedNodes: 1,
+      },
+    });
+    live.push({ env, fake });
+
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: runId } } }),
+    ).resolves.toBeDefined();
+    expect(fake.deleted).toContainEqual({ serviceId: 'svc-old', environmentId: 'env-1' });
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it('fails closed without creating a node when capacity discovery fails', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.listRunServices = async () => {
+      throw new Error('Railway list unavailable');
+    };
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: { projectId: 'proj-1', environmentId: 'env-1' },
+    });
+    live.push({ env, fake });
+
+    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/Railway list unavailable/);
+    expect(fake.created).toHaveLength(0);
+    expect(relay.releases).toHaveLength(1);
   });
 
   it('teardown cold-deletes by run id when the handle has no service_id', async () => {

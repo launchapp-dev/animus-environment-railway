@@ -39,6 +39,12 @@ Unit tests mock fetch / the Railway API. To run the gated integration suite
 
 - `RAILWAY_TOKEN` — API token with service create/delete on the project
 - `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID`
+- `ANIMUS_ENV_CLIENT_ID` — stable logical owner for restart-safe capacity
+  accounting (recommended for multi-client projects)
+- `ANIMUS_ENV_MAX_MANAGED_NODES` — hard per-client node cap (default `5`)
+- `ANIMUS_ENV_CAPACITY_LOCK_DIR` — directory shared by all local environment
+  plugin processes for that client; defaults to
+  `/tmp/animus-environment-railway-capacity`
 - `ANIMUS_ENV_RELAY_PUBLIC_URL` — a `wss://` URL reachable FROM Railway that
   routes to this plugin's relay port (`ANIMUS_ENV_RELAY_PORT`); on Railway this
   is the daemon service's public domain with the relay port exposed.
@@ -68,8 +74,8 @@ unchanged — no plugin-side work expected, but verify the runner honors
 ## Notes for the integrator
 
 - **Teardown/GC**: `teardown` is idempotent (missing service = success);
-  `RailwayEnvironment.gcOrphans()` sweeps this instance's orphaned
-  `animus-run-<instanceId>-*` services (never another live instance's);
+  `RailwayEnvironment.gcOrphans()` sweeps only services created by its current
+  process plus that process's pre-cap names (never another live process's);
   `gcOrphans({ allInstances: true })` also reaps crashed-instance leftovers —
   safe only when a single plugin instance manages the project. Schedule one of
   these (daemon housekeeping) once routing lands.
