@@ -66,7 +66,9 @@ class FakeRailway implements RailwayApi {
   /** Set false to simulate a service that never dials home. */
   bootBridge = true;
   /** Model Railway's restart-visible service inventory for multi-client tests. */
-  trackCreatedServices = false;
+  trackCreatedServices = true;
+  /** Delay control-plane visibility after create has already returned. */
+  createdVisibilityDelayMs = 0;
   /** Hold creation open to exercise cross-process admission races. */
   createDelayMs = 0;
   private readonly bridges: BridgeClient[] = [];
@@ -79,7 +81,15 @@ class FakeRailway implements RailwayApi {
     if (this.createDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.createDelayMs));
     }
-    if (this.trackCreatedServices) this.listed.push({ id: serviceId, name: input.name });
+    if (this.trackCreatedServices) {
+      const expose = (): void => {
+        if (!this.deleted.some((entry) => entry.serviceId === serviceId)) {
+          this.listed.push({ id: serviceId, name: input.name });
+        }
+      };
+      if (this.createdVisibilityDelayMs > 0) setTimeout(expose, this.createdVisibilityDelayMs);
+      else expose();
+    }
     if (this.bootBridge) {
       const url = input.variables.ANIMUS_ENV_WSS_URL;
       const token = input.variables.ANIMUS_ENV_RUN_TOKEN;
@@ -681,6 +691,7 @@ describe('pure helpers', () => {
       ANIMUS_ENV_DIAL_TIMEOUT_SECS: '60',
       ANIMUS_ENV_CLIENT_ID: 'portal-production',
       ANIMUS_ENV_MAX_MANAGED_NODES: '7',
+      ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS: '1234',
     } as NodeJS.ProcessEnv);
     expect(config).toMatchObject({
       projectId: 'p',
@@ -690,6 +701,7 @@ describe('pure helpers', () => {
       dialTimeoutSecs: 60,
       clientId: 'portal-production',
       maxManagedNodes: 7,
+      capacityConfirmationTimeoutMs: 1234,
     });
     expect(DEFAULT_MAX_MANAGED_NODES).toBe(5);
     expect(configFromEnv({ RAILWAY_TOKEN: 'railway-secret' } as NodeJS.ProcessEnv).actorBindingSecret).toBe(
@@ -708,6 +720,13 @@ describe('pure helpers', () => {
           config: { maxManagedNodes: 1.5 },
         }),
     ).toThrow(/non-negative integer/);
+    expect(
+      () =>
+        new RailwayEnvironment({
+          railway: new FakeRailway(),
+          config: { capacityConfirmationTimeoutMs: -1 },
+        }),
+    ).toThrow(/CAPACITY_CONFIRMATION_TIMEOUT_MS must be a non-negative integer/);
   });
 });
 
@@ -853,6 +872,64 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
       reason: expect.objectContaining({ message: expect.stringMatching(/1\/1 managed nodes/) }),
     });
     expect(fake.created).toHaveLength(1);
+  });
+
+  it('holds cross-process admission until a created service becomes visible', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.trackCreatedServices = true;
+    fake.createdVisibilityDelayMs = 75;
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+      capacityConfirmationTimeoutMs: 1_000,
+    };
+    const envA = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    const envB = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: envA, fake }, { env: envB, fake });
+
+    const results = await Promise.allSettled([
+      envA.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-delayed-a' } } }),
+      envB.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-delayed-b' } } }),
+    ]);
+
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    expect(results.find((result) => result.status === 'rejected')).toMatchObject({
+      status: 'rejected',
+      reason: expect.objectContaining({ message: expect.stringMatching(/1\/1 managed nodes/) }),
+    });
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it('deletes an unconfirmed create before releasing cross-process admission', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.trackCreatedServices = false;
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        clientId: 'portal-production',
+        maxManagedNodes: 1,
+        capacityConfirmationTimeoutMs: 75,
+      },
+    });
+    live.push({ env, fake });
+
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'run-never-visible' } } }),
+    ).rejects.toThrow(/did not confirm created service.*75ms/);
+    expect(fake.created).toHaveLength(1);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
+    expect(relay.releases).toHaveLength(1);
   });
 
   it('conservatively counts unscoped pre-cap names against a configured client', async () => {
@@ -1140,6 +1217,8 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
 
   it('teardownNode deletes by id or name and is idempotent', async () => {
     const { env, fake } = await makeEnv();
+    // Model an eventually consistent delete listing for the second lookup.
+    fake.trackCreatedServices = false;
     fake.listed = [{ id: 'svc-1', name: `${SERVICE_NAME_PREFIX}aaa` }];
     expect(await env.teardownNode('svc-1')).toEqual(['svc-1']);
     expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);

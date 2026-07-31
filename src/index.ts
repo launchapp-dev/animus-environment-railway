@@ -82,6 +82,12 @@ const plugin = defineEnvironmentPlugin({
       required: false,
     },
     {
+      name: 'ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS',
+      description:
+        'Milliseconds to wait under the admission lock for a created service to become visible in Railway inventory (default 30000).',
+      required: false,
+    },
+    {
       name: 'ANIMUS_ENV_RELAY_SOCK',
       description: 'Local unix socket exposed by the singleton relay (default /tmp/animus-env-relay.sock).',
       required: false,

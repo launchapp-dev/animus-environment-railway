@@ -54,7 +54,10 @@ closed when capacity cannot be verified. A cross-process lock under
 `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
 `/tmp/animus-environment-railway-capacity`) serializes recount-and-create for
 the same project/client; every process for that client must share this path.
-Service names contain only a hash of the client id.
+The lock remains held until the new service appears in Railway inventory. If
+that confirmation exceeds `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS`
+(default 30 seconds), the plugin deletes the unconfirmed service and fails the
+prepare closed. Service names contain only a hash of the client id.
 
 `exec_session` actor authority is bound at prepare time. The plugin injects
 only the SDK-authenticated actor as `ANIMUS_ACTOR_JSON`, signs the persisted

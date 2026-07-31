@@ -45,6 +45,9 @@ Unit tests mock fetch / the Railway API. To run the gated integration suite
 - `ANIMUS_ENV_CAPACITY_LOCK_DIR` — directory shared by all local environment
   plugin processes for that client; defaults to
   `/tmp/animus-environment-railway-capacity`
+- `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS` — maximum time admission waits
+  for a created service to appear in Railway inventory before deleting it and
+  failing closed (default `30000`)
 - `ANIMUS_ENV_RELAY_PUBLIC_URL` — a `wss://` URL reachable FROM Railway that
   routes to this plugin's relay port (`ANIMUS_ENV_RELAY_PORT`); on Railway this
   is the daemon service's public domain with the relay port exposed.

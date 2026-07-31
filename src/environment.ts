@@ -346,7 +346,9 @@ const DEFAULT_CLIENT_ID = 'animus-environment-railway';
 /** Default hard admission limit for one stable environment-plugin client. */
 export const DEFAULT_MAX_MANAGED_NODES = 5;
 export const DEFAULT_CAPACITY_LOCK_ROOT = '/tmp/animus-environment-railway-capacity';
+export const DEFAULT_CAPACITY_CONFIRMATION_TIMEOUT_MS = 30_000;
 const CAPACITY_LOCK_WAIT_MS = 90_000;
+const CAPACITY_VISIBILITY_POLL_MS = 100;
 
 /** Stable service prefix for one logical plugin client. The fingerprint keeps
  * capacity accounting restart-safe without exposing the configured client id. */
@@ -523,6 +525,9 @@ export interface RailwayEnvironmentConfig {
   /** Shared local directory for cross-process admission locks. Every plugin
    * process belonging to one logical client must see the same directory. */
   capacityLockRoot?: string;
+  /** How long admission keeps its cross-process lock while waiting for a new
+   * Railway service to become visible in inventory. */
+  capacityConfirmationTimeoutMs?: number;
 }
 
 /** Read the config from the process env (the plugin's runtime posture). */
@@ -553,6 +558,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
       ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
       : undefined,
     capacityLockRoot: env.ANIMUS_ENV_CAPACITY_LOCK_DIR,
+    capacityConfirmationTimeoutMs: env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS
+      ? Number(env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS)
+      : undefined,
   };
 }
 
@@ -564,6 +572,16 @@ function validatedMaxManagedNodes(value: number | undefined): number {
     );
   }
   return limit;
+}
+
+function validatedCapacityConfirmationTimeoutMs(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_CAPACITY_CONFIRMATION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeout) || timeout < 0) {
+    throw new Error(
+      `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS must be a non-negative integer (received ${String(value)})`,
+    );
+  }
+  return timeout;
 }
 
 /** Resolve the project/environment ids for a prepare: explicit spec.metadata
@@ -937,6 +955,7 @@ export class RailwayEnvironment {
   readonly instanceId: string = shortId('i');
   private readonly clientId: string;
   private readonly maxManagedNodes: number;
+  private readonly capacityConfirmationTimeoutMs: number;
   /** Services created by this live client. Unioned with Railway's listing so
    * eventual list consistency cannot let concurrent prepares oversubscribe. */
   private readonly locallyManagedServices = new Map<
@@ -961,6 +980,9 @@ export class RailwayEnvironment {
     this.relayBindingSecret = this.config.relayBindingSecret?.trim() || this.actorBindingSecret;
     this.clientId = this.config.clientId?.trim() || this.config.relayOwnerId?.trim() || DEFAULT_CLIENT_ID;
     this.maxManagedNodes = validatedMaxManagedNodes(this.config.maxManagedNodes);
+    this.capacityConfirmationTimeoutMs = validatedCapacityConfirmationTimeoutMs(
+      this.config.capacityConfirmationTimeoutMs,
+    );
   }
 
   private async capacitySocketIsActive(socketPath: string): Promise<boolean> {
@@ -1064,6 +1086,35 @@ export class RailwayEnvironment {
     }
   }
 
+  private async confirmCreatedServiceVisible(args: {
+    projectId: string;
+    serviceId: string;
+    serviceName: string;
+  }): Promise<void> {
+    const deadline = Date.now() + this.capacityConfirmationTimeoutMs;
+    let lastListError: unknown;
+    while (true) {
+      try {
+        const services = await this.railway().listRunServices(args.projectId);
+        if (services.some((service) => service.id === args.serviceId && service.name === args.serviceName)) return;
+        lastListError = undefined;
+      } catch (error) {
+        lastListError = error;
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(CAPACITY_VISIBILITY_POLL_MS, remainingMs)));
+    }
+
+    const listFailure =
+      lastListError instanceof Error ? `; last inventory error: ${lastListError.message}` : '';
+    throw new Error(
+      `Railway did not confirm created service '${args.serviceName}' (${args.serviceId}) in inventory within ` +
+        `${this.capacityConfirmationTimeoutMs}ms; failing closed${listFailure}`,
+    );
+  }
+
   private async createWithinCapacity(args: {
     projectId: string;
     environmentId: string;
@@ -1134,6 +1185,31 @@ export class RailwayEnvironment {
         name: args.serviceName,
         environmentId: args.environmentId,
       });
+      try {
+        // Keep the cross-process admission lock until Railway's authoritative
+        // inventory exposes this create. Without this barrier, a second plugin
+        // process can observe stale capacity and oversubscribe the client.
+        await this.confirmCreatedServiceVisible({
+          projectId: args.projectId,
+          serviceId: created.serviceId,
+          serviceName: args.serviceName,
+        });
+      } catch (confirmationError) {
+        let rollbackError: unknown;
+        try {
+          await railway.deleteService(created.serviceId, args.environmentId);
+        } catch (error) {
+          rollbackError = error;
+        } finally {
+          this.locallyManagedServices.delete(created.serviceId);
+        }
+        if (rollbackError instanceof Error) {
+          const confirmationMessage =
+            confirmationError instanceof Error ? confirmationError.message : String(confirmationError);
+          throw new Error(`${confirmationMessage}; rollback delete failed: ${rollbackError.message}`);
+        }
+        throw confirmationError;
+      }
       return created;
     });
   }
