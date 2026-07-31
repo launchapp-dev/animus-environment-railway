@@ -21,7 +21,7 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createConnection, createServer, type Server } from 'node:net';
 import { join } from 'node:path';
 
@@ -103,7 +103,13 @@ interface RelayCredentials {
   ownerToken: string;
 }
 
-import { DEAD_DEPLOYMENT_STATES, RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+import {
+  DEAD_DEPLOYMENT_STATES,
+  RailwayClient,
+  SERVICE_NAME_PREFIX,
+  type CreatedService,
+  type RailwayApi,
+} from './railway.js';
 import { makeCredentialsServicer } from './credentials-servicer.js';
 
 // Short, Railway-valid service-name token. This is cosmetic substrate naming,
@@ -1096,6 +1102,98 @@ export class RailwayEnvironment {
     }
   }
 
+  private capacityReservationDir(scope: string): string {
+    const root = this.config.capacityLockRoot?.trim() || DEFAULT_CAPACITY_LOCK_ROOT;
+    const scopeId = createHash('sha256').update(scope).digest('hex').slice(0, 24);
+    return join(root, 'reservations', scopeId);
+  }
+
+  private async readCapacityReservations(scope: string): Promise<
+    Array<{ path: string; serviceId?: string; serviceName?: string }>
+  > {
+    const dir = this.capacityReservationDir(scope);
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    return Promise.all(
+      names.map(async (name) => {
+        const path = join(dir, name);
+        try {
+          const value = JSON.parse(await readFile(path, 'utf8')) as {
+            serviceId?: unknown;
+            serviceName?: unknown;
+          };
+          return {
+            path,
+            serviceId: typeof value.serviceId === 'string' ? value.serviceId : undefined,
+            serviceName: typeof value.serviceName === 'string' ? value.serviceName : undefined,
+          };
+        } catch {
+          // A truncated/corrupt reservation is still evidence of an uncertain
+          // create. Count it rather than silently reopening capacity.
+          return { path };
+        }
+      }),
+    );
+  }
+
+  private async writeCapacityReservation(
+    scope: string,
+    serviceName: string,
+    serviceId?: string,
+  ): Promise<string> {
+    const dir = this.capacityReservationDir(scope);
+    await mkdir(dir, { recursive: true });
+    const reservationId = createHash('sha256').update(serviceName).digest('hex').slice(0, 24);
+    const path = join(dir, `${reservationId}.json`);
+    await writeFile(path, JSON.stringify({ serviceName, serviceId }), { mode: 0o600 });
+    return path;
+  }
+
+  /** Remove only reservations proven to refer to a service Railway has
+   * successfully deleted. Unknown/corrupt reservations remain fail-closed. */
+  private async clearCapacityReservation(
+    projectId: string,
+    serviceId: string,
+    serviceName?: string,
+  ): Promise<void> {
+    const scope = clientServicePrefix(projectId, this.clientId);
+    const reservations = await this.readCapacityReservations(scope);
+    await Promise.all(
+      reservations
+        .filter(
+          (reservation) =>
+            reservation.serviceId === serviceId ||
+            (serviceName !== undefined && reservation.serviceName === serviceName),
+        )
+        .map((reservation) => rm(reservation.path, { force: true })),
+    );
+  }
+
+  /** Clear only durable create intents that identify the lifecycle target a
+   * caller explicitly asked to tear down. A successful inventory miss proves
+   * that target is absent, but says nothing about unrelated reservations (and
+   * a corrupt reservation has no safe identity), so those remain fail-closed. */
+  private async reconcileCapacityReservations(
+    scope: string,
+    targetIds: ReadonlySet<string>,
+    targetNames: ReadonlySet<string>,
+  ): Promise<void> {
+    const reservations = await this.readCapacityReservations(scope);
+    for (const reservation of reservations) {
+      if (
+        (reservation.serviceId !== undefined && targetIds.has(reservation.serviceId)) ||
+        (reservation.serviceName !== undefined && targetNames.has(reservation.serviceName))
+      ) {
+        await rm(reservation.path, { force: true });
+      }
+    }
+  }
+
   private async withAdmissionLock<T>(scope: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.admissionTail;
     let release!: () => void;
@@ -1170,12 +1268,36 @@ export class RailwayEnvironment {
       for (const existing of services.filter((service) => replaceNames.has(service.name))) {
         await railway.deleteService(existing.id, args.environmentId);
         this.locallyManagedServices.delete(existing.id);
+        await this.clearCapacityReservation(args.projectId, existing.id, existing.name);
       }
       for (const [serviceId, local] of this.locallyManagedServices) {
         if (local.scope === scope && replaceNames.has(local.name)) {
           await railway.deleteService(serviceId, local.environmentId);
           this.locallyManagedServices.delete(serviceId);
+          await this.clearCapacityReservation(args.projectId, serviceId, local.name);
         }
+      }
+
+      const reservations = await this.readCapacityReservations(scope);
+      const remainingReservations: typeof reservations = [];
+      for (const reservation of reservations) {
+        const visible = services.some(
+          (service) =>
+            (reservation.serviceId !== undefined && service.id === reservation.serviceId) ||
+            (reservation.serviceName !== undefined && service.name === reservation.serviceName),
+        );
+        if (visible) {
+          // Railway inventory is authoritative now and will be counted below.
+          await rm(reservation.path, { force: true });
+        } else {
+          remainingReservations.push(reservation);
+        }
+      }
+      if (remainingReservations.some((reservation) => replaceNames.has(reservation.serviceName ?? ''))) {
+        throw new Error(
+          `Railway cannot verify the prior service for run '${args.serviceName}'; ` +
+            'failing closed until inventory confirms it or an operator reaps it',
+        );
       }
 
       const remaining = services.filter((service) => !replaceNames.has(service.name));
@@ -1195,6 +1317,13 @@ export class RailwayEnvironment {
         if (local.scope === scope) managedIds.add(serviceId);
       }
 
+      for (const reservation of remainingReservations) {
+        // A post-create reservation with a known id and this process's local
+        // record describe the same node; count that uncertainty once.
+        if (reservation.serviceId !== undefined && managedIds.has(reservation.serviceId)) continue;
+        managedIds.add(`reservation:${reservation.path}`);
+      }
+
       if (managedIds.size >= this.maxManagedNodes) {
         throw new Error(
           `Railway node capacity exhausted for client '${this.clientId}': ` +
@@ -1203,15 +1332,32 @@ export class RailwayEnvironment {
         );
       }
 
-      const created = await railway.createRunService({
-        projectId: args.projectId,
-        environmentId: args.environmentId,
-        name: args.serviceName,
-        image: args.image,
-        variables: args.variables,
-        startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
-        registryCredentials: this.config.registryCredentials,
-      });
+      // Persist intent before asking Railway to create. If this process dies or
+      // receives an ambiguous response, another process must conservatively
+      // retain the slot until inventory verifies the service.
+      const reservationPath = await this.writeCapacityReservation(scope, args.serviceName);
+      let created: CreatedService;
+      try {
+        created = await railway.createRunService({
+          projectId: args.projectId,
+          environmentId: args.environmentId,
+          name: args.serviceName,
+          image: args.image,
+          variables: args.variables,
+          startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
+          registryCredentials: this.config.registryCredentials,
+        });
+      } catch (error) {
+        // The mutation may have reached Railway even though its response did
+        // not reach us. A list immediately after that failure is not proof of
+        // absence because Railway inventory can lag the mutation. Retain the
+        // durable intent until an explicit teardown/reap/GC action either
+        // deletes the service or verifies that this specific target is absent.
+        throw error;
+      }
+      // Once Railway returns an id, persist it before any visibility check so
+      // teardown/reap/GC can clear exactly this retained reservation.
+      await this.writeCapacityReservation(scope, args.serviceName, created.serviceId);
       this.locallyManagedServices.set(created.serviceId, {
         scope,
         name: args.serviceName,
@@ -1226,19 +1372,25 @@ export class RailwayEnvironment {
           serviceId: created.serviceId,
           serviceName: args.serviceName,
         });
+        await rm(reservationPath, { force: true });
       } catch (confirmationError) {
         let rollbackError: unknown;
+        let rollbackFailed = false;
         try {
           await railway.deleteService(created.serviceId, args.environmentId);
         } catch (error) {
+          rollbackFailed = true;
           rollbackError = error;
-        } finally {
-          this.locallyManagedServices.delete(created.serviceId);
         }
-        if (rollbackError instanceof Error) {
+        if (!rollbackFailed) {
+          this.locallyManagedServices.delete(created.serviceId);
+          await rm(reservationPath, { force: true });
+        }
+        if (rollbackFailed) {
           const confirmationMessage =
             confirmationError instanceof Error ? confirmationError.message : String(confirmationError);
-          throw new Error(`${confirmationMessage}; rollback delete failed: ${rollbackError.message}`);
+          const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+          throw new Error(`${confirmationMessage}; rollback delete failed: ${rollbackMessage}`);
         }
         throw confirmationError;
       }
@@ -1608,6 +1760,7 @@ export class RailwayEnvironment {
       await Promise.resolve(relay.releaseRun(handle.id, credentials));
     }
     const environmentId = meta?.environment_id || this.config.environmentId;
+    const projectId = meta?.project_id || this.config.projectId;
     // Fast path: a full handle carries the service_id; delete it directly.
     if (meta?.service_id) {
       if (!environmentId) {
@@ -1617,23 +1770,35 @@ export class RailwayEnvironment {
       }
       await this.railway().deleteService(meta.service_id, environmentId);
       this.locallyManagedServices.delete(meta.service_id);
+      if (projectId) {
+        await this.clearCapacityReservation(projectId, meta.service_id);
+      }
       return;
     }
     // Cold path: only a run id (no service_id) — resolve the service by its
     // deterministic name and delete it. This closes the crash window where a
     // service was created but the caller never received the full handle.
     const runId = meta?.animus_run_id?.trim();
-    const projectId = meta?.project_id || this.config.projectId;
     if (!runId || !projectId || !environmentId) return;
     const serviceNames = new Set([
       deterministicServiceName(projectId, this.clientId, runId),
       legacyDeterministicServiceName(projectId, runId),
     ]);
-    const match = (await this.railway().listRunServices(projectId)).find((s) => serviceNames.has(s.name));
-    if (match) {
+    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    await this.withAdmissionLock(admissionScope, async () => {
+      const scope = clientServicePrefix(projectId, this.clientId);
+      const match = (await this.railway().listRunServices(projectId)).find((s) => serviceNames.has(s.name));
+      if (!match) {
+        // A successful inventory miss proves this run's deterministic create
+        // intent is absent. Reconcile it under the same lock as admission so a
+        // concurrent prepare cannot observe or race stale capacity accounting.
+        await this.reconcileCapacityReservations(scope, new Set(), serviceNames);
+        return;
+      }
       await this.railway().deleteService(match.id, environmentId);
       this.locallyManagedServices.delete(match.id);
-    }
+      await this.clearCapacityReservation(projectId, match.id, match.name);
+    });
   }
 
   /** GC sweep: delete orphaned run services (no live relay registration).
@@ -1668,6 +1833,7 @@ export class RailwayEnvironment {
       if (liveHandles.has(svc.name)) continue;
       await this.railway().deleteService(svc.id, environmentId);
       this.locallyManagedServices.delete(svc.id);
+      await this.clearCapacityReservation(target, svc.id, svc.name);
       removed.push(svc.id);
     }
     return removed;
@@ -1699,19 +1865,35 @@ export class RailwayEnvironment {
     // service name, OR a bare animus run id — resolving the run id to its
     // deterministic service name so a daemon that persisted only the run id can
     // drive teardown after losing the in-memory handle (TASK-797/TASK-933).
-    const byRunName = deterministicServiceName(projectId, this.clientId, idOrName);
-    const byLegacyRunName = legacyDeterministicServiceName(projectId, idOrName);
-    const match = (await this.railway().listRunServices(projectId)).find(
-      (s) =>
-        s.id === idOrName ||
-        s.name === idOrName ||
-        s.name === byRunName ||
-        s.name === byLegacyRunName,
-    );
-    if (!match) return [];
-    await this.railway().deleteService(match.id, environmentId);
-    this.locallyManagedServices.delete(match.id);
-    return [match.id];
+    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    return this.withAdmissionLock(admissionScope, async () => {
+      const scope = clientServicePrefix(projectId, this.clientId);
+      const byRunName = deterministicServiceName(projectId, this.clientId, idOrName);
+      const byLegacyRunName = legacyDeterministicServiceName(projectId, idOrName);
+      const services = await this.railway().listRunServices(projectId);
+      const match = services.find(
+        (s) =>
+          s.id === idOrName ||
+          s.name === idOrName ||
+          s.name === byRunName ||
+          s.name === byLegacyRunName,
+      );
+      if (!match) {
+        // A successful lifecycle inventory can prove a persisted named intent
+        // no longer has a Railway service. This is the restart recovery path;
+        // corrupt/unidentifiable intents remain fail-closed.
+        await this.reconcileCapacityReservations(
+          scope,
+          new Set([idOrName]),
+          new Set([idOrName, byRunName, byLegacyRunName]),
+        );
+        return [];
+      }
+      await this.railway().deleteService(match.id, environmentId);
+      this.locallyManagedServices.delete(match.id);
+      await this.clearCapacityReservation(projectId, match.id, match.name);
+      return [match.id];
+    });
   }
 
   /** Node-management (`environment/reap`): delete orphaned/dead nodes.
@@ -1784,6 +1966,7 @@ export class RailwayEnvironment {
       if (!opts.dryRun) {
         await this.railway().deleteService(node.id, environmentId);
         this.locallyManagedServices.delete(node.id);
+        await this.clearCapacityReservation(projectId, node.id, node.name);
       }
       deleted.push(node.id);
     }

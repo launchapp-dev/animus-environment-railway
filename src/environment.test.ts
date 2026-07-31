@@ -971,6 +971,212 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(relay.releases).toHaveLength(1);
   });
 
+  it('retains shared capacity when an unconfirmed create cannot be rolled back', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.trackCreatedServices = false;
+    fake.deleteService = async () => {
+      throw new Error('Railway delete unavailable');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+      capacityConfirmationTimeoutMs: 0,
+    };
+    const envA = new RailwayEnvironment({
+      railway: fake,
+      relay: new RecordingRelay(),
+      config,
+    });
+    const envB = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: envA, fake }, { env: envB, fake });
+
+    await expect(envA.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(
+      /rollback delete failed: Railway delete unavailable/,
+    );
+    await expect(envB.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/1\/1 managed nodes/);
+    expect(fake.created).toHaveLength(1);
+
+    // Once Railway exposes the retained service, an explicit lifecycle delete
+    // proves it is gone and releases the durable reservation.
+    fake.listed = [{ id: 'svc-1', name: fake.created[0]!.name }];
+    fake.deleteService = FakeRailway.prototype.deleteService.bind(fake);
+    await expect(envA.teardownNode('svc-1')).resolves.toEqual(['svc-1']);
+    await expect(envB.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(
+      /did not confirm created service/,
+    );
+    expect(fake.created).toHaveLength(2);
+  });
+
+  it('retains admission after an ambiguous create even when immediate inventory is stale', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.createRunService = async (input) => {
+      fake.created.push(input);
+      throw new Error('connection reset after mutation');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+    };
+    const envA = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    const envB = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: envA, fake }, { env: envB, fake });
+
+    await expect(envA.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(
+      /connection reset after mutation/,
+    );
+    await expect(envB.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/1\/1 managed nodes/);
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it('retains admission when a failed create is present in inventory', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.createRunService = async (input) => {
+      fake.created.push(input);
+      fake.listed.push({ id: 'svc-ambiguous', name: input.name });
+      throw new Error('connection reset after mutation');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+    };
+    const envA = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    const envB = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: envA, fake }, { env: envB, fake });
+
+    await expect(envA.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(
+      /connection reset after mutation/,
+    );
+    await expect(envB.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(/1\/1 managed nodes/);
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it('releases a named reservation after restart when inventory verifies the service is absent', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    let listCalls = 0;
+    fake.listRunServices = async () => {
+      listCalls += 1;
+      if (listCalls > 1) throw new Error('Railway inventory unavailable');
+      return [];
+    };
+    fake.createRunService = async (input) => {
+      fake.created.push(input);
+      throw new Error('connection reset after mutation');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+    };
+    const env = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env, fake });
+
+    await expect(env.prepare({ spec: { kind: 'railway' } })).rejects.toThrow(
+      /connection reset after mutation/,
+    );
+    expect(listCalls).toBe(1);
+
+    // Model a daemon restart. Once inventory is healthy and authoritatively
+    // empty, the next process must reconcile the named intent and create.
+    fake.listRunServices = async () => [];
+    fake.createRunService = FakeRailway.prototype.createRunService.bind(fake);
+    fake.trackCreatedServices = true;
+    const restarted = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: restarted, fake });
+
+    await expect(restarted.teardownNode(fake.created[0]!.name)).resolves.toEqual([]);
+    await expect(restarted.prepare({ spec: { kind: 'railway' } })).resolves.toBeDefined();
+    expect(fake.created).toHaveLength(2);
+  });
+
+  it('run-id-only teardown reconciles an ambiguous create after restart', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.createRunService = async (input) => {
+      fake.created.push(input);
+      throw new Error('connection reset after mutation');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+    };
+    const runId = 'ambiguous-run';
+    const env = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env, fake });
+
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: runId } } }),
+    ).rejects.toThrow(/connection reset after mutation/);
+
+    // Model a restart with only the persisted run id. Successful empty
+    // inventory proves the ambiguous create is absent and releases its slot.
+    fake.createRunService = FakeRailway.prototype.createRunService.bind(fake);
+    const restarted = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env: restarted, fake });
+    await expect(
+      restarted.teardown({
+        id: runId,
+        workspace_root: '/workspace',
+        metadata: { animus_run_id: runId, project_id: 'proj-1', environment_id: 'env-1' },
+      }),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      restarted.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'next-run' } } }),
+    ).resolves.toBeDefined();
+    expect(fake.created).toHaveLength(2);
+  });
+
+  it('does not clear an unrelated ambiguous-create reservation on a teardown miss', async () => {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    fake.createRunService = async (input) => {
+      fake.created.push(input);
+      throw new Error('connection reset after mutation');
+    };
+    const capacityLockRoot = mkdtempSync('/tmp/animus-cap-');
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      clientId: 'portal-production',
+      maxManagedNodes: 1,
+      capacityLockRoot,
+    };
+    const env = new RailwayEnvironment({ railway: fake, relay: new RecordingRelay(), config });
+    live.push({ env, fake });
+
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'ambiguous-run' } } }),
+    ).rejects.toThrow(/connection reset after mutation/);
+    await expect(env.teardownNode('different-run')).resolves.toEqual([]);
+    await expect(
+      env.prepare({ spec: { kind: 'railway', metadata: { animus_run_id: 'new-run' } } }),
+    ).rejects.toThrow(/1\/1 managed nodes/);
+    expect(fake.created).toHaveLength(1);
+  });
+
   it('conservatively counts unscoped pre-cap names against a configured client', async () => {
     const fake = new FakeRailway();
     fake.bootBridge = false;
