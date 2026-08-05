@@ -167,6 +167,12 @@ const plugin = defineEnvironmentPlugin({
       required: false,
     },
     {
+      name: 'KIMI_CODE_HOME',
+      description:
+        'Daemon-side dir holding the Kimi Code config.toml and credentials/kimi-code.json; bundled base64-injected into each node so the kimi harness runs on the shared login. Defaults to the durable portal path /data/animus-state/kimi-config when unset.',
+      required: false,
+    },
+    {
       name: 'GITHUB_TOKEN',
       description: 'GitHub token injected into each node for git push + PR creation from the harness (fallback when no GitHub App is configured).',
       required: false,

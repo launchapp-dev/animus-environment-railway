@@ -696,7 +696,48 @@ export function harnessCredentialVars(hostEnv: NodeJS.ProcessEnv): Record<string
     vars.GITHUB_TOKEN = hostEnv.GITHUB_TOKEN;
     vars.GH_TOKEN = hostEnv.GITHUB_TOKEN;
   }
+  Object.assign(vars, kimiNodeBundle(hostEnv));
   return vars;
+}
+
+/** Durable dir the portal Connections flow stores Kimi Code config and
+ *  credentials in (mirrors the codex/claude config dirs). */
+export const DEFAULT_KIMI_CODE_HOME = '/data/animus-state/kimi-config';
+
+/** Files bundled from the Kimi config dir into each node, whichever exist. */
+const KIMI_BUNDLE_FILES = ['config.toml', 'credentials/kimi-code.json'] as const;
+
+/** Resolve the daemon-side Kimi Code config directory. An explicitly empty
+ *  value disables credential bundling; only an unset value falls back. */
+export function kimiConfigDir(
+  hostEnv: NodeJS.ProcessEnv,
+  defaultDir: string = DEFAULT_KIMI_CODE_HOME,
+): string | null {
+  const dir = (hostEnv.KIMI_CODE_HOME ?? defaultDir).trim().replace(/\/$/, '');
+  return dir.length > 0 ? dir : null;
+}
+
+/** Bundle the daemon-side Kimi config/credentials for the node bootstrap as a
+ *  base64-encoded JSON `{"files":{...}}` containing the UTF-8 contents of
+ *  whichever of `config.toml` / `credentials/kimi-code.json` exist. Best-effort
+ *  like the codex auth: injects nothing when the dir or files are absent, and
+ *  never logs the bundle or file contents. */
+export function kimiNodeBundle(
+  hostEnv: NodeJS.ProcessEnv,
+  defaultDir: string = DEFAULT_KIMI_CODE_HOME,
+): Record<string, string> {
+  const dir = kimiConfigDir(hostEnv, defaultDir);
+  if (!dir) return {};
+  const files: Record<string, string> = {};
+  for (const rel of KIMI_BUNDLE_FILES) {
+    try {
+      files[rel] = readFileSync(`${dir}/${rel}`, 'utf8');
+    } catch {
+      // file absent; skip
+    }
+  }
+  if (Object.keys(files).length === 0) return {};
+  return { ANIMUS_NODE_KIMI_BUNDLE_B64: Buffer.from(JSON.stringify({ files }), 'utf8').toString('base64') };
 }
 
 /** Central Claude-subscription refresher. A node must NEVER hold the refresh
