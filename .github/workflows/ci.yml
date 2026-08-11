@@ -22,8 +22,14 @@ jobs:
         with:
           node-version: 20
           cache: npm
+
+      # Direct installation-token mint against the launchapp-dev installation.
+      # actions/create-github-app-token@fee1f7d resolved a token that could not
+      # read the private dependencies (npm git fetch 404); this explicit mint
+      # against the installation that actually hosts them is proven to work.
+      # The mint script lives in scripts/mint-dependency-token.mjs so the
+      # workflow YAML stays free of heredoc/indentation hazards.
       - name: Mint read-only dependency token
-        id: dependency-token
         shell: bash
         env:
           APP_ID: ${{ secrets.ANIMUS_DEPENDENCY_APP_ID }}
@@ -31,91 +37,49 @@ jobs:
         run: |
           set -euo pipefail
           set +x
-          # Direct installation-token mint against the launchapp-dev installation.
-          # actions/create-github-app-token@fee1f7d resolved a token that could not
-          # read the private dependencies (npm git fetch 404); this explicit mint
-          # against the installation that actually hosts them is proven to work.
-          TOKEN=$(node <<'NODE'
-          const crypto = require("crypto");
-          const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
-          (async () => {
-          const now = Math.floor(Date.now() / 1000);
-          const h = b64({ alg: "RS256", typ: "JWT" });
-          const p = b64({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID });
-          const jwt = h + "." + p + "." + crypto
-          .sign("sha256", Buffer.from(h + "." + p), process.env.APP_PRIVATE_KEY)
-          .toString("base64url");
-          const headers = {
-          authorization: "Bearer " + jwt,
-          accept: "application/vnd.github+json",
-          "user-agent": "animus-env-railway-ci",
-          "content-type": "application/json",
-          };
-          const inst = await (await fetch(
-          "https://api.github.com/app/installations",
-          { headers },
-          )).json();
-          const target = inst.find((i) => i.account && i.account.login === "launchapp-dev");
-          if (!target) throw new Error("no launchapp-dev installation for the dependency app");
-          const mint = await fetch(
-          "https://api.github.com/app/installations/" + target.id + "/access_tokens",
-          {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-          repositories: ["animus-environment-base", "animus-env-transport"],
-          permissions: { contents: "read" },
-          }),
-          },
-          );
-          const body = await mint.json().catch(() => ({}));
-          if (mint.status !== 201 || !body.token) {
-          throw new Error("dependency token mint failed: " + mint.status + " " + (body.message || ""));
-          }
-          process.stdout.write(body.token);
-          })().catch((error) => { console.error(error.message); process.exit(1); });
-          NODE
-                    )
-                    echo "::add-mask::${TOKEN}"
-                    echo "token=${TOKEN}" >> "${GITHUB_OUTPUT}"
-                - name: Configure temporary dependency authentication
-                  shell: bash
-                  env:
-                    DEPENDENCY_TOKEN: ${{ steps.dependency-token.outputs.token }}
-                  run: |
-                    set -euo pipefail
-                    set +x
-                    if [[ -z "${DEPENDENCY_TOKEN}" ]]; then
-                      echo "::error::GitHub App did not mint a read-only dependency token"
-                      exit 1
-                    fi
-          
-                    # Longest insteadOf match wins: the two private dependencies receive
-                    # the repository-scoped installation token; public Git dependencies
-                    # fall back to anonymous HTTPS. The token is masked and never echoed.
-                    git config --global url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-environment-base.git".insteadOf \
-                      "ssh://git@github.com/launchapp-dev/animus-environment-base.git"
-                    git config --global url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-env-transport.git".insteadOf \
-                      "ssh://git@github.com/launchapp-dev/animus-env-transport.git"
-                    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-                - run: npm ci
-                - run: npm run typecheck
-                - run: npm test
-                - run: npm run build
-                - run: npm run bundle
-                - run: npm audit
-                - name: Remove temporary dependency authentication
-                  if: always()
-                  shell: bash
-                  env:
-                    DEPENDENCY_TOKEN: ${{ steps.dependency-token.outputs.token }}
-                  run: |
-                    set +x
-                    if [[ -n "${DEPENDENCY_TOKEN}" ]]; then
-                      git config --global --unset-all \
-                        url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-environment-base.git".insteadOf || true
-                      git config --global --unset-all \
-                        url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-env-transport.git".insteadOf || true
-                    fi
-                    git config --global --unset-all url."https://github.com/".insteadOf || true
-          
+          TOKEN="$(node scripts/mint-dependency-token.mjs)"
+          echo "::add-mask::${TOKEN}"
+          echo "DEPENDENCY_TOKEN=${TOKEN}" >> "${GITHUB_ENV}"
+
+      - name: Configure temporary dependency authentication
+        shell: bash
+        env:
+          DEPENDENCY_TOKEN: ${{ env.DEPENDENCY_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +x
+          if [[ -z "${DEPENDENCY_TOKEN}" ]]; then
+            echo "::error::GitHub App did not mint a read-only dependency token"
+            exit 1
+          fi
+
+          # Longest insteadOf match wins: the two private dependencies receive
+          # the repository-scoped installation token; public Git dependencies
+          # fall back to anonymous HTTPS. The token is masked and never echoed.
+          git config --global url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-environment-base.git".insteadOf \
+            "ssh://git@github.com/launchapp-dev/animus-environment-base.git"
+          git config --global url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-env-transport.git".insteadOf \
+            "ssh://git@github.com/launchapp-dev/animus-env-transport.git"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run bundle
+      - run: npm audit --audit-level=high
+
+      - name: Remove temporary dependency authentication
+        if: always()
+        shell: bash
+        env:
+          DEPENDENCY_TOKEN: ${{ env.DEPENDENCY_TOKEN }}
+        run: |
+          set +x
+          if [[ -n "${DEPENDENCY_TOKEN}" ]]; then
+            git config --global --unset-all \
+              url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-environment-base.git".insteadOf || true
+            git config --global --unset-all \
+              url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-env-transport.git".insteadOf || true
+          fi
+          git config --global --unset-all url."https://github.com/".insteadOf || true
