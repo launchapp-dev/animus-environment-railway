@@ -39,42 +39,42 @@ jobs:
           const crypto = require("crypto");
           const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
           (async () => {
-            const now = Math.floor(Date.now() / 1000);
-            const h = b64({ alg: "RS256", typ: "JWT" });
-            const p = b64({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID });
-            const jwt = h + "." + p + "." + crypto
-              .sign("sha256", Buffer.from(h + "." + p), process.env.APP_PRIVATE_KEY)
-              .toString("base64url");
-            const headers = {
-              authorization: "Bearer " + jwt,
-              accept: "application/vnd.github+json",
-              "user-agent": "animus-env-railway-ci",
-              "content-type": "application/json",
-            };
-            const inst = await (await fetch(
-              "https://api.github.com/app/installations",
-              { headers },
-            )).json();
-            const target = inst.find((i) => i.account && i.account.login === "launchapp-dev");
-            if (!target) throw new Error("no launchapp-dev installation for the dependency app");
-            const mint = await fetch(
-              "https://api.github.com/app/installations/" + target.id + "/access_tokens",
-              {
-                method: "POST",
-                headers,
-                body: JSON.stringify({
-                  repositories: ["animus-environment-base", "animus-env-transport"],
-                  permissions: { contents: "read" },
-                }),
-              },
-            );
-            const body = await mint.json().catch(() => ({}));
-            if (mint.status !== 201 || !body.token) {
-              throw new Error("dependency token mint failed: " + mint.status + " " + (body.message || ""));
-            }
-            process.stdout.write(body.token);
+          const now = Math.floor(Date.now() / 1000);
+          const h = b64({ alg: "RS256", typ: "JWT" });
+          const p = b64({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID });
+          const jwt = h + "." + p + "." + crypto
+          .sign("sha256", Buffer.from(h + "." + p), process.env.APP_PRIVATE_KEY)
+          .toString("base64url");
+          const headers = {
+          authorization: "Bearer " + jwt,
+          accept: "application/vnd.github+json",
+          "user-agent": "animus-env-railway-ci",
+          "content-type": "application/json",
+          };
+          const inst = await (await fetch(
+          "https://api.github.com/app/installations",
+          { headers },
+          )).json();
+          const target = inst.find((i) => i.account && i.account.login === "launchapp-dev");
+          if (!target) throw new Error("no launchapp-dev installation for the dependency app");
+          const mint = await fetch(
+          "https://api.github.com/app/installations/" + target.id + "/access_tokens",
+          {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+          repositories: ["animus-environment-base", "animus-env-transport"],
+          permissions: { contents: "read" },
+          }),
+          },
+          );
+          const body = await mint.json().catch(() => ({}));
+          if (mint.status !== 201 || !body.token) {
+          throw new Error("dependency token mint failed: " + mint.status + " " + (body.message || ""));
+          }
+          process.stdout.write(body.token);
           })().catch((error) => { console.error(error.message); process.exit(1); });
-                    NODE
+          NODE
                     )
                     echo "::add-mask::${TOKEN}"
                     echo "token=${TOKEN}" >> "${GITHUB_OUTPUT}"
