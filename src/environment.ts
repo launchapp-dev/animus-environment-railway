@@ -21,6 +21,9 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createConnection, createServer, type Server } from 'node:net';
+import { join } from 'node:path';
 
 import {
   planWorkspace,
@@ -105,7 +108,13 @@ interface RelayCredentials {
   ownerToken: string;
 }
 
-import { DEAD_DEPLOYMENT_STATES, RailwayClient, SERVICE_NAME_PREFIX, type RailwayApi } from './railway.js';
+import {
+  DEAD_DEPLOYMENT_STATES,
+  RailwayClient,
+  SERVICE_NAME_PREFIX,
+  type CreatedService,
+  type RailwayApi,
+} from './railway.js';
 import { makeCredentialsServicer } from './credentials-servicer.js';
 
 // Short, Railway-valid service-name token. This is cosmetic substrate naming,
@@ -407,11 +416,41 @@ function specRunId(spec: { metadata?: unknown }): string | null {
   return runId.length > 0 ? runId : null;
 }
 
-/** Deterministic, Railway-valid service name for a run: `animus-run-<12 hex>`
- *  (23 chars, under Railway's ~32-char limit). Scoped by project id so the same
- *  run id in different projects never collides. No per-process `instanceId` —
- *  determinism across processes is the whole point (reconcile + cold teardown). */
-function deterministicServiceName(projectId: string, runId: string): string {
+const DEFAULT_CLIENT_ID = 'animus-environment-railway';
+
+/** Default hard admission limit for one stable environment-plugin client. */
+export const DEFAULT_MAX_MANAGED_NODES = 5;
+export const DEFAULT_CAPACITY_LOCK_ROOT = '/tmp/animus-environment-railway-capacity';
+export const DEFAULT_CAPACITY_CONFIRMATION_TIMEOUT_MS = 30_000;
+const CAPACITY_LOCK_WAIT_MS = 90_000;
+const CAPACITY_VISIBILITY_POLL_MS = 100;
+
+/** Stable service prefix for one logical plugin client. The fingerprint keeps
+ * capacity accounting restart-safe without exposing the configured client id. */
+export function clientServicePrefix(projectId: string, clientId: string): string {
+  const digest = createHash('sha256').update(JSON.stringify([projectId, clientId])).digest('hex').slice(0, 8);
+  return `${SERVICE_NAME_PREFIX}${digest}-`;
+}
+
+/** Deterministic, Railway-valid service name for a run, scoped to one stable
+ * plugin client. At 30 characters it remains below Railway's name limit. */
+export function deterministicServiceName(projectId: string, clientId: string, runId: string): string {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([projectId, clientId, runId]))
+    .digest('hex')
+    .slice(0, 10);
+  return `${clientServicePrefix(projectId, clientId)}${digest}`;
+}
+
+/** New cap-aware names are the only run-service names that can be safely
+ * attributed to a different logical client. Everything else under the shared
+ * run prefix is legacy/unknown and must be charged conservatively. */
+function isCapAwareServiceName(name: string): boolean {
+  return /^animus-run-[0-9a-f]{8}-(?:[0-9a-f]{10}|r[0-9a-f]{10})$/.test(name);
+}
+
+/** Pre-cap deterministic name retained for cold teardown/reconciliation. */
+function legacyDeterministicServiceName(projectId: string, runId: string): string {
   const digest = createHash('sha256').update(JSON.stringify([projectId, runId])).digest('hex').slice(0, 12);
   return `${SERVICE_NAME_PREFIX}${digest}`;
 }
@@ -564,6 +603,17 @@ export interface RailwayEnvironmentConfig {
   relayOwnerId?: string;
   /** Shared singleton control-plane credential. */
   relayControlToken?: string;
+  /** Stable logical client id used to scope restart-safe node accounting. */
+  clientId?: string;
+  /** Hard maximum Railway services this client may manage at once. Defaults
+   * to five. Zero disables new prepares without affecting teardown/reap. */
+  maxManagedNodes?: number;
+  /** Persistent directory for same-host admission coordination and durable
+   * reservations. One logical client must have exactly one admission host. */
+  capacityLockRoot?: string;
+  /** How long admission keeps its cross-process lock while waiting for a new
+   * Railway service to become visible in inventory. */
+  capacityConfirmationTimeoutMs?: number;
 }
 
 /** Read the config from the process env (the plugin's runtime posture). */
@@ -589,7 +639,45 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): RailwayEnvi
       env.ANIMUS_ENV_RELAY_BINDING_SECRET ?? env.ANIMUS_ENV_ACTOR_BINDING_SECRET ?? env.RAILWAY_TOKEN,
     relayOwnerId: env.ANIMUS_ENV_RELAY_OWNER_ID,
     relayControlToken: env.ANIMUS_ENV_RELAY_CONTROL_TOKEN,
+    clientId: env.ANIMUS_ENV_CLIENT_ID,
+    // Treat blank/whitespace-only configuration as unset. In particular,
+    // Number('   ') is zero, which must not accidentally turn a templated but
+    // empty environment variable into an intentional admission shutdown.
+    maxManagedNodes:
+      env.ANIMUS_ENV_MAX_MANAGED_NODES !== undefined && env.ANIMUS_ENV_MAX_MANAGED_NODES.trim() !== ''
+        ? Number(env.ANIMUS_ENV_MAX_MANAGED_NODES)
+        : undefined,
+    capacityLockRoot:
+      env.ANIMUS_ENV_CAPACITY_LOCK_DIR?.trim() ||
+      (env.RAILWAY_VOLUME_MOUNT_PATH?.trim()
+        ? join(env.RAILWAY_VOLUME_MOUNT_PATH.trim(), 'animus-environment-railway-capacity')
+        : undefined),
+    capacityConfirmationTimeoutMs:
+      env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS !== undefined &&
+      env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS.trim() !== ''
+        ? Number(env.ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS)
+        : undefined,
   };
+}
+
+function validatedMaxManagedNodes(value: number | undefined): number {
+  const limit = value ?? DEFAULT_MAX_MANAGED_NODES;
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw new Error(
+      `ANIMUS_ENV_MAX_MANAGED_NODES must be a non-negative integer (received ${String(value)})`,
+    );
+  }
+  return limit;
+}
+
+function validatedCapacityConfirmationTimeoutMs(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_CAPACITY_CONFIRMATION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeout) || timeout < 0) {
+    throw new Error(
+      `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS must be a non-negative integer (received ${String(value)})`,
+    );
+  }
+  return timeout;
 }
 
 /** Resolve the project/environment ids for a prepare: explicit spec.metadata
@@ -1015,9 +1103,20 @@ export class RailwayEnvironment {
   private readonly backendCallScopes = new Map<string, BackendCallScope>();
   private readonly actorBindingSecret: string;
   private readonly relayBindingSecret: string;
-  /** Random per-process identity baked into service names, so a GC sweep can
-   *  distinguish this instance's runs from another live plugin instance's. */
+  /** Legacy per-process identity retained so GC can recognize pre-cap random
+   * service names during a rolling upgrade. New names use the stable client id. */
   readonly instanceId: string = shortId('i');
+  private readonly clientId: string;
+  private readonly maxManagedNodes: number;
+  private readonly capacityConfirmationTimeoutMs: number;
+  /** Services created by this live client. Unioned with Railway's listing so
+   * eventual list consistency cannot let concurrent prepares oversubscribe. */
+  private readonly locallyManagedServices = new Map<
+    string,
+    { scope: string; name: string; environmentId: string }
+  >();
+  /** Serialize list/reconcile/create admission for concurrent prepare RPCs. */
+  private admissionTail: Promise<void> = Promise.resolve();
 
   private backendClient: PluginClient | null = null;
   private logClient: PluginClient | null = null;
@@ -1032,6 +1131,401 @@ export class RailwayEnvironment {
     // RAILWAY_TOKEN unless ANIMUS_ENV_ACTOR_BINDING_SECRET is explicit.
     this.actorBindingSecret = this.config.actorBindingSecret?.trim() || randomBytes(32).toString('hex');
     this.relayBindingSecret = this.config.relayBindingSecret?.trim() || this.actorBindingSecret;
+    this.clientId = this.config.clientId?.trim() || this.config.relayOwnerId?.trim() || DEFAULT_CLIENT_ID;
+    this.maxManagedNodes = validatedMaxManagedNodes(this.config.maxManagedNodes);
+    this.capacityConfirmationTimeoutMs = validatedCapacityConfirmationTimeoutMs(
+      this.config.capacityConfirmationTimeoutMs,
+    );
+  }
+
+  private async capacitySocketIsActive(socketPath: string): Promise<boolean> {
+    return new Promise<boolean>((resolve, reject) => {
+      const socket = createConnection(socketPath);
+      let settled = false;
+      const finish = (active: boolean): void => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(active);
+      };
+      socket.once('connect', () => finish(true));
+      socket.once('error', (error: NodeJS.ErrnoException) => {
+        if (error.code === 'ECONNREFUSED' || error.code === 'ENOENT') {
+          finish(false);
+          return;
+        }
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        reject(error);
+      });
+    });
+  }
+
+  private async tryListenCapacitySocket(socketPath: string): Promise<Server | null> {
+    return new Promise<Server | null>((resolve, reject) => {
+      const server = createServer((socket) => socket.destroy());
+      const onError = (error: NodeJS.ErrnoException): void => {
+        server.removeAllListeners();
+        if (error.code === 'EADDRINUSE') {
+          resolve(null);
+          return;
+        }
+        reject(error);
+      };
+      server.once('error', onError);
+      server.listen(socketPath, () => {
+        server.off('error', onError);
+        resolve(server);
+      });
+    });
+  }
+
+  private async acquireCapacityLock(scope: string): Promise<() => Promise<void>> {
+    const root = this.config.capacityLockRoot?.trim() || DEFAULT_CAPACITY_LOCK_ROOT;
+    // Linux abstract sockets are owned entirely by the kernel: they are
+    // exclusive across processes and disappear atomically on process death,
+    // so no stale pathname can race with a replacement owner. macOS/BSD use a
+    // compact filesystem socket for local development and tests.
+    const lockId = createHash('sha256').update(JSON.stringify([root, scope])).digest('hex').slice(0, 24);
+    const filesystemSocket = process.platform !== 'linux';
+    if (filesystemSocket) await mkdir(root, { recursive: true });
+    const socketPath = filesystemSocket ? join(root, `${lockId}.sock`) : `\0animus-env-cap-${lockId}`;
+    const deadline = Date.now() + CAPACITY_LOCK_WAIT_MS;
+
+    while (true) {
+      const server = await this.tryListenCapacitySocket(socketPath);
+      if (server) {
+        return async () => {
+          await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+          if (filesystemSocket) await rm(socketPath, { force: true }).catch(() => undefined);
+        };
+      }
+
+      // A crashed process leaves only a dead socket pathname. Probe before
+      // removing it so a slow/old owner can never have its live lock stolen.
+      if (!(await this.capacitySocketIsActive(socketPath))) {
+        if (filesystemSocket) {
+          await rm(socketPath, { force: true }).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== 'ENOENT') throw error;
+          });
+        }
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `timed out waiting for Railway node capacity lock for client '${this.clientId}'; ` +
+            'failing closed without creating a node',
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50 + Math.floor(Math.random() * 50)));
+    }
+  }
+
+  private capacityReservationDir(scope: string): string {
+    const root = this.config.capacityLockRoot?.trim() || DEFAULT_CAPACITY_LOCK_ROOT;
+    const scopeId = createHash('sha256').update(scope).digest('hex').slice(0, 24);
+    return join(root, 'reservations', scopeId);
+  }
+
+  private async readCapacityReservations(scope: string): Promise<
+    Array<{ path: string; serviceId?: string; serviceName?: string }>
+  > {
+    const dir = this.capacityReservationDir(scope);
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+    return Promise.all(
+      names.map(async (name) => {
+        const path = join(dir, name);
+        try {
+          const value = JSON.parse(await readFile(path, 'utf8')) as {
+            serviceId?: unknown;
+            serviceName?: unknown;
+          };
+          return {
+            path,
+            serviceId: typeof value.serviceId === 'string' ? value.serviceId : undefined,
+            serviceName: typeof value.serviceName === 'string' ? value.serviceName : undefined,
+          };
+        } catch {
+          // A truncated/corrupt reservation is still evidence of an uncertain
+          // create. Count it rather than silently reopening capacity.
+          return { path };
+        }
+      }),
+    );
+  }
+
+  private async writeCapacityReservation(
+    scope: string,
+    serviceName: string,
+    serviceId?: string,
+  ): Promise<string> {
+    const dir = this.capacityReservationDir(scope);
+    await mkdir(dir, { recursive: true });
+    const reservationId = createHash('sha256').update(serviceName).digest('hex').slice(0, 24);
+    const path = join(dir, `${reservationId}.json`);
+    await writeFile(path, JSON.stringify({ serviceName, serviceId }), { mode: 0o600 });
+    return path;
+  }
+
+  /** Remove only reservations proven to refer to a service Railway has
+   * successfully deleted. Unknown/corrupt reservations remain fail-closed. */
+  private async clearCapacityReservation(
+    projectId: string,
+    serviceId: string,
+    serviceName?: string,
+  ): Promise<void> {
+    const scope = clientServicePrefix(projectId, this.clientId);
+    const reservations = await this.readCapacityReservations(scope);
+    await Promise.all(
+      reservations
+        .filter(
+          (reservation) =>
+            reservation.serviceId === serviceId ||
+            (serviceName !== undefined && reservation.serviceName === serviceName),
+        )
+        .map((reservation) => rm(reservation.path, { force: true })),
+    );
+  }
+
+  /** Clear only durable create intents that identify the lifecycle target a
+   * caller explicitly asked to tear down. A successful inventory miss proves
+   * that target is absent, but says nothing about unrelated reservations (and
+   * a corrupt reservation has no safe identity), so those remain fail-closed. */
+  private async reconcileCapacityReservations(
+    scope: string,
+    targetIds: ReadonlySet<string>,
+    targetNames: ReadonlySet<string>,
+  ): Promise<void> {
+    const reservations = await this.readCapacityReservations(scope);
+    for (const reservation of reservations) {
+      if (
+        (reservation.serviceId !== undefined && targetIds.has(reservation.serviceId)) ||
+        (reservation.serviceName !== undefined && targetNames.has(reservation.serviceName))
+      ) {
+        await rm(reservation.path, { force: true });
+      }
+    }
+  }
+
+  private async withAdmissionLock<T>(scope: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.admissionTail;
+    let release!: () => void;
+    this.admissionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    let releaseFileLock: (() => Promise<void>) | undefined;
+    try {
+      releaseFileLock = await this.acquireCapacityLock(scope);
+      return await operation();
+    } finally {
+      // Always advance the in-process queue, even if releasing the
+      // cross-process lock fails. Otherwise one cleanup error permanently
+      // strands every later prepare behind an unresolved admissionTail.
+      try {
+        await releaseFileLock?.();
+      } finally {
+        release();
+      }
+    }
+  }
+
+  private async confirmCreatedServiceVisible(args: {
+    projectId: string;
+    serviceId: string;
+    serviceName: string;
+  }): Promise<void> {
+    const deadline = Date.now() + this.capacityConfirmationTimeoutMs;
+    let lastListError: unknown;
+    while (true) {
+      try {
+        const services = await this.railway().listRunServices(args.projectId);
+        if (services.some((service) => service.id === args.serviceId && service.name === args.serviceName)) return;
+        lastListError = undefined;
+      } catch (error) {
+        lastListError = error;
+      }
+
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(CAPACITY_VISIBILITY_POLL_MS, remainingMs)));
+    }
+
+    const listFailure =
+      lastListError instanceof Error ? `; last inventory error: ${lastListError.message}` : '';
+    throw new Error(
+      `Railway did not confirm created service '${args.serviceName}' (${args.serviceId}) in inventory within ` +
+        `${this.capacityConfirmationTimeoutMs}ms; failing closed${listFailure}`,
+    );
+  }
+
+  private async createWithinCapacity(args: {
+    projectId: string;
+    environmentId: string;
+    serviceName: string;
+    legacyServiceName?: string;
+    image: string;
+    variables: Record<string, string>;
+  }): Promise<{ serviceId: string; deploymentId?: string | null }> {
+    const admissionScope = JSON.stringify([args.projectId, this.clientId]);
+    return this.withAdmissionLock(admissionScope, async () => {
+      // A zero cap is an intentional admission shutdown. Reject before
+      // same-run reconciliation so retrying a known run cannot delete its
+      // existing service while new node creation is disabled.
+      if (this.maxManagedNodes === 0) {
+        throw new Error(
+          `Railway node capacity exhausted for client '${this.clientId}': ` +
+            '0/0 managed nodes; wait for teardown or run `animus environment reap`, or raise ' +
+            'ANIMUS_ENV_MAX_MANAGED_NODES intentionally',
+        );
+      }
+      const railway = this.railway();
+      const scope = clientServicePrefix(args.projectId, this.clientId);
+      const services = await railway.listRunServices(args.projectId);
+
+      // Same-run reconciliation belongs inside admission: the replaced service
+      // must not consume capacity, and concurrent retries must not both create.
+      const replaceNames = new Set(
+        [args.serviceName, args.legacyServiceName].filter((name): name is string => Boolean(name)),
+      );
+      for (const existing of services.filter((service) => replaceNames.has(service.name))) {
+        await railway.deleteService(existing.id, args.environmentId);
+        this.locallyManagedServices.delete(existing.id);
+        await this.clearCapacityReservation(args.projectId, existing.id, existing.name);
+      }
+      for (const [serviceId, local] of this.locallyManagedServices) {
+        if (local.scope === scope && replaceNames.has(local.name)) {
+          await railway.deleteService(serviceId, local.environmentId);
+          this.locallyManagedServices.delete(serviceId);
+          await this.clearCapacityReservation(args.projectId, serviceId, local.name);
+        }
+      }
+
+      const reservations = await this.readCapacityReservations(scope);
+      const remainingReservations: typeof reservations = [];
+      for (const reservation of reservations) {
+        const visible = services.some(
+          (service) =>
+            (reservation.serviceId !== undefined && service.id === reservation.serviceId) ||
+            (reservation.serviceName !== undefined && service.name === reservation.serviceName),
+        );
+        if (visible) {
+          // Railway inventory is authoritative now and will be counted below.
+          await rm(reservation.path, { force: true });
+        } else {
+          remainingReservations.push(reservation);
+        }
+      }
+      if (remainingReservations.some((reservation) => replaceNames.has(reservation.serviceName ?? ''))) {
+        throw new Error(
+          `Railway cannot verify the prior service for run '${args.serviceName}'; ` +
+            'failing closed until inventory confirms it or an operator reaps it',
+        );
+      }
+
+      const remaining = services.filter((service) => !replaceNames.has(service.name));
+      const managedIds = new Set(
+        remaining
+          .filter(
+            (service) =>
+              service.name.startsWith(scope) ||
+              // Only a valid cap-aware name can be safely assigned to another
+              // client. Count every legacy or unknown run name conservatively
+              // rather than risk exceeding the limit during a rolling upgrade.
+              (service.name.startsWith(SERVICE_NAME_PREFIX) && !isCapAwareServiceName(service.name)),
+          )
+          .map((service) => service.id),
+      );
+      for (const [serviceId, local] of this.locallyManagedServices) {
+        if (local.scope === scope) managedIds.add(serviceId);
+      }
+
+      for (const reservation of remainingReservations) {
+        // A post-create reservation with a known id and this process's local
+        // record describe the same node; count that uncertainty once.
+        if (reservation.serviceId !== undefined && managedIds.has(reservation.serviceId)) continue;
+        managedIds.add(`reservation:${reservation.path}`);
+      }
+
+      if (managedIds.size >= this.maxManagedNodes) {
+        throw new Error(
+          `Railway node capacity exhausted for client '${this.clientId}': ` +
+            `${managedIds.size}/${this.maxManagedNodes} managed nodes; wait for teardown or run ` +
+            '`animus environment reap`, or raise ANIMUS_ENV_MAX_MANAGED_NODES intentionally',
+        );
+      }
+
+      // Persist intent before asking Railway to create. If this process dies or
+      // receives an ambiguous response, another process must conservatively
+      // retain the slot until inventory verifies the service.
+      const reservationPath = await this.writeCapacityReservation(scope, args.serviceName);
+      let created: CreatedService;
+      try {
+        created = await railway.createRunService({
+          projectId: args.projectId,
+          environmentId: args.environmentId,
+          name: args.serviceName,
+          image: args.image,
+          variables: args.variables,
+          startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
+          registryCredentials: this.config.registryCredentials,
+        });
+      } catch (error) {
+        // The mutation may have reached Railway even though its response did
+        // not reach us. A list immediately after that failure is not proof of
+        // absence because Railway inventory can lag the mutation. Retain the
+        // durable intent until an explicit teardown/reap/GC action either
+        // deletes the service or verifies that this specific target is absent.
+        throw error;
+      }
+      // Once Railway returns an id, persist it before any visibility check so
+      // teardown/reap/GC can clear exactly this retained reservation.
+      await this.writeCapacityReservation(scope, args.serviceName, created.serviceId);
+      this.locallyManagedServices.set(created.serviceId, {
+        scope,
+        name: args.serviceName,
+        environmentId: args.environmentId,
+      });
+      try {
+        // Keep the cross-process admission lock until Railway's authoritative
+        // inventory exposes this create. Without this barrier, a second plugin
+        // process can observe stale capacity and oversubscribe the client.
+        await this.confirmCreatedServiceVisible({
+          projectId: args.projectId,
+          serviceId: created.serviceId,
+          serviceName: args.serviceName,
+        });
+        await rm(reservationPath, { force: true });
+      } catch (confirmationError) {
+        let rollbackError: unknown;
+        let rollbackFailed = false;
+        try {
+          await railway.deleteService(created.serviceId, args.environmentId);
+        } catch (error) {
+          rollbackFailed = true;
+          rollbackError = error;
+        }
+        if (!rollbackFailed) {
+          this.locallyManagedServices.delete(created.serviceId);
+          await rm(reservationPath, { force: true });
+        }
+        if (rollbackFailed) {
+          const confirmationMessage =
+            confirmationError instanceof Error ? confirmationError.message : String(confirmationError);
+          const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+          throw new Error(`${confirmationMessage}; rollback delete failed: ${rollbackMessage}`);
+        }
+        throw confirmationError;
+      }
+      return created;
+    });
   }
 
   /** Lazily spawn the parent-side backend plugin a node's `backend/call` is
@@ -1159,20 +1653,9 @@ export class RailwayEnvironment {
       repository: repositoryScope,
     });
     const serviceName = runId
-      ? deterministicServiceName(projectId, runId)
-      : `${this.instancePrefix()}${handleServiceToken(id)}`;
-    // Reconcile before create: any pre-existing service with this run's
-    // deterministic name is a leaked orphan from a failed earlier prepare of the
-    // SAME run (nothing else can own that name), so delete it first to keep the
-    // invariant "at most one service per run id" and avoid an accumulating leak.
-    if (runId) {
-      try {
-        const existing = (await this.railway().listRunServices(projectId)).find((s) => s.name === serviceName);
-        if (existing) await this.railway().deleteService(existing.id, environmentId);
-      } catch {
-        // Best-effort reconcile; a create below still proceeds.
-      }
-    }
+      ? deterministicServiceName(projectId, this.clientId, runId)
+      : `${clientServicePrefix(projectId, this.clientId)}${handleServiceToken(id)}`;
+    const legacyServiceName = runId ? legacyDeterministicServiceName(projectId, runId) : undefined;
 
     let relay: RelayTransport | undefined;
     let url: string;
@@ -1214,18 +1697,17 @@ export class RailwayEnvironment {
     // stripped) so the node can't rotate/corrupt the shared daemon credential.
     const claudeVars = await claudeNodeCredentials(process.env, Date.now());
     try {
-      const created = await this.railway().createRunService({
+      const created = await this.createWithinCapacity({
         projectId,
         environmentId,
-        name: serviceName,
+        serviceName,
+        legacyServiceName,
         image,
         variables: {
           ...runVariables({ wssUrl: url, token, specEnv: spec.env, actorJson: binding.actorJson }),
           ...claudeVars,
           ...appVars,
         },
-        startCommand: this.config.bridgeCommand ?? DEFAULT_BRIDGE_COMMAND,
-        registryCredentials: this.config.registryCredentials,
       });
       serviceId = created.serviceId;
       deploymentId = created.deploymentId;
@@ -1265,6 +1747,7 @@ export class RailwayEnvironment {
         await this.railway()
           .deleteService(serviceId, environmentId)
           .catch(() => undefined);
+        this.locallyManagedServices.delete(serviceId);
       }
       throw err;
     }
@@ -1432,6 +1915,7 @@ export class RailwayEnvironment {
       await Promise.resolve(relay.releaseRun(handle.id, credentials));
     }
     const environmentId = meta?.environment_id || this.config.environmentId;
+    const projectId = meta?.project_id || this.config.projectId;
     // Fast path: a full handle carries the service_id; delete it directly.
     if (meta?.service_id) {
       if (!environmentId) {
@@ -1440,24 +1924,43 @@ export class RailwayEnvironment {
         );
       }
       await this.railway().deleteService(meta.service_id, environmentId);
+      this.locallyManagedServices.delete(meta.service_id);
+      if (projectId) {
+        await this.clearCapacityReservation(projectId, meta.service_id);
+      }
       return;
     }
     // Cold path: only a run id (no service_id) — resolve the service by its
     // deterministic name and delete it. This closes the crash window where a
     // service was created but the caller never received the full handle.
     const runId = meta?.animus_run_id?.trim();
-    const projectId = meta?.project_id || this.config.projectId;
     if (!runId || !projectId || !environmentId) return;
-    const serviceName = deterministicServiceName(projectId, runId);
-    const match = (await this.railway().listRunServices(projectId)).find((s) => s.name === serviceName);
-    if (match) await this.railway().deleteService(match.id, environmentId);
+    const serviceNames = new Set([
+      deterministicServiceName(projectId, this.clientId, runId),
+      legacyDeterministicServiceName(projectId, runId),
+    ]);
+    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    await this.withAdmissionLock(admissionScope, async () => {
+      const scope = clientServicePrefix(projectId, this.clientId);
+      const match = (await this.railway().listRunServices(projectId)).find((s) => serviceNames.has(s.name));
+      if (!match) {
+        // A successful inventory miss proves this run's deterministic create
+        // intent is absent. Reconcile it under the same lock as admission so a
+        // concurrent prepare cannot observe or race stale capacity accounting.
+        await this.reconcileCapacityReservations(scope, new Set(), serviceNames);
+        return;
+      }
+      await this.railway().deleteService(match.id, environmentId);
+      this.locallyManagedServices.delete(match.id);
+      await this.clearCapacityReservation(projectId, match.id, match.name);
+    });
   }
 
   /** GC sweep: delete orphaned run services (no live relay registration).
    *
-   *  Default scope is THIS instance's services only (name prefix embeds the
-   *  per-process `instanceId`), so a sweep can never delete another live
-   *  plugin instance's runs in a shared project. Pass
+   *  Default scope is only services this process created plus its pre-cap
+   *  instance prefix. Stable client names are intentionally not enough proof
+   *  of orphanhood because another plugin process may own them. Pass
    *  `allInstances: true` — safe ONLY when a single plugin instance manages
    *  the project — to also reap `animus-run-*` services left behind by
    *  crashed previous instances. Returns the deleted service ids. */
@@ -1468,21 +1971,30 @@ export class RailwayEnvironment {
     if (!target) throw new Error('gcOrphans needs a project id (RAILWAY_PROJECT_ID or argument)');
     const environmentId = opts.environmentId ?? this.config.environmentId;
     if (!environmentId) throw new Error('gcOrphans needs an environment id (RAILWAY_ENVIRONMENT_ID or argument)');
-    const services = await this.railway().listRunServices(target);
-    const liveHandles = new Set(
-      (this.relayInstance?.registeredRuns() ?? []).map(
-        (handleId) => `${this.instancePrefix()}${handleServiceToken(handleId)}`,
-      ),
-    );
-    const removed: string[] = [];
-    for (const svc of services) {
-      if (!svc.name.startsWith(SERVICE_NAME_PREFIX)) continue;
-      if (!opts.allInstances && !svc.name.startsWith(this.instancePrefix())) continue;
-      if (liveHandles.has(svc.name)) continue;
-      await this.railway().deleteService(svc.id, environmentId);
-      removed.push(svc.id);
-    }
-    return removed;
+    const admissionScope = JSON.stringify([target, this.clientId]);
+    return this.withAdmissionLock(admissionScope, async () => {
+      const services = await this.railway().listRunServices(target);
+      const clientPrefix = clientServicePrefix(target, this.clientId);
+      const liveHandles = new Set(
+        (this.relayInstance?.registeredRuns() ?? []).flatMap((handleId) => [
+          `${clientPrefix}${handleServiceToken(handleId)}`,
+          `${this.instancePrefix()}${handleServiceToken(handleId)}`,
+        ]),
+      );
+      const removed: string[] = [];
+      for (const svc of services) {
+        if (!svc.name.startsWith(SERVICE_NAME_PREFIX)) continue;
+        if (!opts.allInstances && !this.locallyManagedServices.has(svc.id) && !svc.name.startsWith(this.instancePrefix())) {
+          continue;
+        }
+        if (liveHandles.has(svc.name)) continue;
+        await this.railway().deleteService(svc.id, environmentId);
+        this.locallyManagedServices.delete(svc.id);
+        await this.clearCapacityReservation(target, svc.id, svc.name);
+        removed.push(svc.id);
+      }
+      return removed;
+    });
   }
 
   /** Node-management (`environment/list`): describe every `animus-run-*` service
@@ -1511,13 +2023,35 @@ export class RailwayEnvironment {
     // service name, OR a bare animus run id — resolving the run id to its
     // deterministic service name so a daemon that persisted only the run id can
     // drive teardown after losing the in-memory handle (TASK-797/TASK-933).
-    const byRunName = deterministicServiceName(projectId, idOrName);
-    const match = (await this.railway().listRunServices(projectId)).find(
-      (s) => s.id === idOrName || s.name === idOrName || s.name === byRunName,
-    );
-    if (!match) return [];
-    await this.railway().deleteService(match.id, environmentId);
-    return [match.id];
+    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    return this.withAdmissionLock(admissionScope, async () => {
+      const scope = clientServicePrefix(projectId, this.clientId);
+      const byRunName = deterministicServiceName(projectId, this.clientId, idOrName);
+      const byLegacyRunName = legacyDeterministicServiceName(projectId, idOrName);
+      const services = await this.railway().listRunServices(projectId);
+      const match = services.find(
+        (s) =>
+          s.id === idOrName ||
+          s.name === idOrName ||
+          s.name === byRunName ||
+          s.name === byLegacyRunName,
+      );
+      if (!match) {
+        // A successful lifecycle inventory can prove a persisted named intent
+        // no longer has a Railway service. This is the restart recovery path;
+        // corrupt/unidentifiable intents remain fail-closed.
+        await this.reconcileCapacityReservations(
+          scope,
+          new Set([idOrName]),
+          new Set([idOrName, byRunName, byLegacyRunName]),
+        );
+        return [];
+      }
+      await this.railway().deleteService(match.id, environmentId);
+      this.locallyManagedServices.delete(match.id);
+      await this.clearCapacityReservation(projectId, match.id, match.name);
+      return [match.id];
+    });
   }
 
   /** Node-management (`environment/reap`): delete orphaned/dead nodes.
@@ -1548,46 +2082,56 @@ export class RailwayEnvironment {
     const environmentId = this.config.environmentId;
     if (!projectId) throw new Error('reap needs a project id (RAILWAY_PROJECT_ID)');
     if (!environmentId) throw new Error('reap needs an environment id (RAILWAY_ENVIRONMENT_ID)');
-    const nodes = await this.describeNodes(projectId);
-    // Protected set = names of runs KNOWN to be live. Two authoritative sources,
-    // unioned: (1) this process's in-memory relay registrations (only meaningful
-    // in the resident daemon), and (2) the daemon-supplied live run ids mapped to
-    // their deterministic service names (works from a fresh CLI process too).
-    const liveNames = new Set(
-      (this.relayInstance?.registeredRuns() ?? []).map(
-        (handleId) => `${this.instancePrefix()}${handleServiceToken(handleId)}`,
-      ),
-    );
-    const ownerKnown = opts.liveRunIds !== undefined;
-    for (const rid of opts.liveRunIds ?? []) liveNames.add(deterministicServiceName(projectId, rid));
-    // In owner-known mode enforce a grace floor so a mid-prepare node (created
-    // before the daemon leased its run) is never reaped out from under itself.
-    const graceSecs = ownerKnown
-      ? Math.max(opts.olderThanSecs ?? 0, REAP_LEAKED_GRACE_SECS)
-      : opts.olderThanSecs;
-    const now = Date.now();
-    const deleted: string[] = [];
-    const kept: EnvironmentNodeDescriptor[] = [];
-    for (const node of nodes) {
-      const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
-      const live = liveNames.has(node.name);
-      const oldEnough =
-        graceSecs === undefined ||
-        (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= graceSecs : true);
-      let reapIt = false;
-      if (dead && oldEnough) reapIt = true;
-      // Owner-known: a healthy node mapping to no live run id is a leak — reap it
-      // WITHOUT `force` (the daemon's live set is authoritative). Legacy path
-      // (no live set supplied) keeps the `all`+`force` empty-liveness guard.
-      else if (!live && oldEnough && (ownerKnown || (opts.all && opts.force))) reapIt = true;
-      if (!reapIt) {
-        kept.push(node);
-        continue;
+    const admissionScope = JSON.stringify([projectId, this.clientId]);
+    return this.withAdmissionLock(admissionScope, async () => {
+      const nodes = await this.describeNodes(projectId);
+      // Protected set = names of runs KNOWN to be live. Two authoritative sources,
+      // unioned: (1) this process's in-memory relay registrations (only meaningful
+      // in the resident daemon), and (2) the daemon-supplied live run ids mapped to
+      // their deterministic service names (works from a fresh CLI process too).
+      const liveNames = new Set(
+        (this.relayInstance?.registeredRuns() ?? []).map(
+          (handleId) => `${clientServicePrefix(projectId, this.clientId)}${handleServiceToken(handleId)}`,
+        ),
+      );
+      const ownerKnown = opts.liveRunIds !== undefined;
+      for (const rid of opts.liveRunIds ?? []) {
+        liveNames.add(deterministicServiceName(projectId, this.clientId, rid));
+        liveNames.add(legacyDeterministicServiceName(projectId, rid));
       }
-      if (!opts.dryRun) await this.railway().deleteService(node.id, environmentId);
-      deleted.push(node.id);
-    }
-    return { deleted, kept, dryRun: opts.dryRun === true };
+      // In owner-known mode enforce a grace floor so a mid-prepare node (created
+      // before the daemon leased its run) is never reaped out from under itself.
+      const graceSecs = ownerKnown
+        ? Math.max(opts.olderThanSecs ?? 0, REAP_LEAKED_GRACE_SECS)
+        : opts.olderThanSecs;
+      const now = Date.now();
+      const deleted: string[] = [];
+      const kept: EnvironmentNodeDescriptor[] = [];
+      for (const node of nodes) {
+        const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
+        const live = liveNames.has(node.name);
+        const oldEnough =
+          graceSecs === undefined ||
+          (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= graceSecs : true);
+        let reapIt = false;
+        if (dead && oldEnough) reapIt = true;
+        // Owner-known: a healthy node mapping to no live run id is a leak — reap it
+        // WITHOUT `force` (the daemon's live set is authoritative). Legacy path
+        // (no live set supplied) keeps the `all`+`force` empty-liveness guard.
+        else if (!live && oldEnough && (ownerKnown || (opts.all && opts.force))) reapIt = true;
+        if (!reapIt) {
+          kept.push(node);
+          continue;
+        }
+        if (!opts.dryRun) {
+          await this.railway().deleteService(node.id, environmentId);
+          this.locallyManagedServices.delete(node.id);
+          await this.clearCapacityReservation(projectId, node.id, node.name);
+        }
+        deleted.push(node.id);
+      }
+      return { deleted, kept, dryRun: opts.dryRun === true };
+    });
   }
 
   /** Shared listing used by list/get/reap: prefer the state-aware query, fall

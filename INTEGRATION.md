@@ -39,6 +39,31 @@ Unit tests mock fetch / the Railway API. To run the gated integration suite
 
 - `RAILWAY_TOKEN` — API token with service create/delete on the project
 - `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT_ID`
+- `ANIMUS_ENV_CLIENT_ID` — stable logical owner for restart-safe capacity
+  accounting (recommended for multi-client projects)
+- `ANIMUS_ENV_MAX_MANAGED_NODES` — hard per-client node cap (default `5`).
+  Setting it to `0` rejects prepares before inventory or same-run
+  reconciliation, preserving existing services while teardown and reap remain
+  available.
+- `ANIMUS_ENV_CAPACITY_LOCK_DIR` — persistent directory used by every
+  environment-plugin process on the client's single admission host; defaults
+  to `$RAILWAY_VOLUME_MOUNT_PATH/animus-environment-railway-capacity` when a
+  Railway volume is mounted, otherwise
+  `/tmp/animus-environment-railway-capacity`. The lock is host-local while
+  reservation files are restart-visible. Do not run independent plugin hosts
+  with the same `ANIMUS_ENV_CLIENT_ID`: this setting is not a distributed
+  coordinator. On Railway, mount a persistent volume and keep the service at
+  one replica (Railway does not support replicas with volumes); the plugin
+  automatically places reservations on that volume unless explicitly
+  overridden.
+- `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS` — maximum time admission waits
+  for a created service to appear in Railway inventory before deleting it and
+  failing closed (default `30000`). An ambiguous create or failed rollback is
+  retained as a durable reservation in the capacity lock directory, so the
+  slot remains charged across restarts until inventory or teardown verifies
+  that service is absent. Reservation files that cannot be decoded are also
+  charged conservatively and require operator inspection rather than silently
+  reopening capacity.
 - `ANIMUS_ENV_RELAY_PUBLIC_URL` — a `wss://` URL reachable FROM Railway that
   routes to this plugin's relay port (`ANIMUS_ENV_RELAY_PORT`); on Railway this
   is the daemon service's public domain with the relay port exposed.
@@ -68,8 +93,8 @@ unchanged — no plugin-side work expected, but verify the runner honors
 ## Notes for the integrator
 
 - **Teardown/GC**: `teardown` is idempotent (missing service = success);
-  `RailwayEnvironment.gcOrphans()` sweeps this instance's orphaned
-  `animus-run-<instanceId>-*` services (never another live instance's);
+  `RailwayEnvironment.gcOrphans()` sweeps only services created by its current
+  process plus that process's pre-cap names (never another live process's);
   `gcOrphans({ allInstances: true })` also reaps crashed-instance leftovers —
   safe only when a single plugin instance manages the project. Schedule one of
   these (daemon housekeeping) once routing lands.

@@ -16,6 +16,7 @@ socket.
 ## Flow
 
 1. **prepare(spec)** — start/reuse the relay listener, mint a per-run token,
+   enforce the client's hard managed-node limit (default 5),
    create a Railway service from the base image (default
    `ghcr.io/launchapp-dev/animus:v0.7.0-rc.2`, override via `spec.image` /
    `ANIMUS_ENV_RAILWAY_IMAGE`) via the Railway GraphQL v2 API
@@ -42,6 +43,42 @@ See `plugin.toml` for the full env surface. Minimum for real runs:
 `ANIMUS_ENV_RELAY_PUBLIC_URL` (a `wss://` URL reachable from Railway that
 routes to this plugin's relay port). Per-run overrides:
 `spec.metadata.railway_project_id` / `railway_environment_id`.
+
+Every logical client is limited to five managed Railway nodes by default.
+`ANIMUS_ENV_CLIENT_ID` gives the client a stable capacity identity across
+plugin restarts; it defaults to `ANIMUS_ENV_RELAY_OWNER_ID`, then
+`animus-environment-railway`. Set `ANIMUS_ENV_MAX_MANAGED_NODES` to a
+non-negative integer to change the limit (`0` disables new prepares while
+leaving teardown and reap available). The zero-cap check happens before
+inventory or same-run reconciliation, so an admission pause never deletes an
+existing service merely because its run is retried. For positive caps,
+admission lists Railway first and fails closed when capacity cannot be
+verified. Unknown and legacy `animus-run-*`
+services count against the client cap unless their name is structurally
+attributable to a different cap-aware client. A retry carrying the same stable
+run id reconciles its prior service under admission before the cap is checked,
+so replacing that service does not consume an additional slot. A host-local,
+cross-process lock keyed by `ANIMUS_ENV_CAPACITY_LOCK_DIR` (default
+`$RAILWAY_VOLUME_MOUNT_PATH/animus-environment-railway-capacity` on a Railway
+volume, otherwise `/tmp/animus-environment-railway-capacity`) serializes
+recount-and-create for the same project/client. The hard-cap contract therefore
+requires one admission host for a client; do not run independent plugin hosts
+with the same `ANIMUS_ENV_CLIENT_ID`. This matches Railway services with a persistent volume,
+which Railway does not permit to run with replicas. Multiple plugin processes
+on that host are supported. Back the directory with that host's persistent
+volume so ambiguous-cleanup reservations survive daemon restarts and remain
+charged until Railway inventory can prove that the service is absent. Deploying
+multiple admission hosts requires an external distributed coordinator and is
+not supported by this filesystem setting.
+The lock remains held until the new service appears in Railway inventory. If
+that confirmation exceeds `ANIMUS_ENV_CAPACITY_CONFIRMATION_TIMEOUT_MS`
+(default 30 seconds), the plugin deletes the unconfirmed service and fails the
+prepare closed. If creation is ambiguous or that cleanup delete fails, the
+plugin keeps a durable reservation under the capacity lock directory and
+continues charging the slot across restarts until successful inventory or
+teardown proves the service absent. Corrupt or incomplete reservation records
+remain charged instead of reopening capacity. Service names contain only a
+hash of the client id.
 
 `exec_session` actor authority is bound at prepare time. The plugin injects
 only the SDK-authenticated actor as `ANIMUS_ACTOR_JSON`, signs the persisted
@@ -117,6 +154,15 @@ release pins `@launchapp-dev/animus-env-transport` to the immutable `v0.3.4` Git
 tag and rejects any different installed package version before writing release
 assets. Private-repository builders must have GitHub read access when running
 `npm ci`; the published environment binary remains self-contained.
+
+GitHub Actions uses a short-lived installation token from a dedicated GitHub
+App. Configure `ANIMUS_DEPENDENCY_APP_ID` and
+`ANIMUS_DEPENDENCY_APP_PRIVATE_KEY` as repository secrets, install the App on
+only `animus-environment-base` and `animus-env-transport`, and grant it only
+Contents: read. The workflow additionally restricts each minted token to those
+two repositories, removes its temporary Git URL mappings on every exit path,
+and relies on the token action's post-step revocation. Do not substitute a
+personal token or long-lived deploy keys.
 
 ## Develop
 
