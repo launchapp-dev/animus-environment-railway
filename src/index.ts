@@ -16,7 +16,7 @@ const env = new RailwayEnvironment();
 
 const plugin = defineEnvironmentPlugin({
   name: 'animus-environment-railway',
-  version: '0.4.23',
+  version: '0.4.24',
   description:
     'Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image, relays harness commands over an outbound WebSocket the container dials home, and deletes the service on teardown.',
   env_required: [
@@ -188,6 +188,12 @@ const plugin = defineEnvironmentPlugin({
       name: 'CODEX_OAUTH_HOME',
       description:
         'Daemon-side dir holding the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription. Defaults to the durable portal path /data/animus-state/codex-config when unset, so codex works on nodes without extra portal config.',
+      required: false,
+    },
+    {
+      name: 'KIMI_CODE_HOME',
+      description:
+        'Daemon-side dir holding the Kimi Code config.toml and credentials/kimi-code.json; bundled base64-injected into each node so the kimi harness runs on the shared login. Defaults to the durable portal path /data/animus-state/kimi-config when unset.',
       required: false,
     },
     {

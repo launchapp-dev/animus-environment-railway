@@ -1,6 +1,6 @@
 schema = "animus.plugin.v1"
 name = "animus-environment-railway"
-version = "0.4.23"
+version = "0.4.24"
 plugin_kind = "environment"
 description = "Railway ephemeral-container execution-environment plugin for Animus (v0.7). Creates a Railway service from the base image via the Railway GraphQL API, relays harness commands over an outbound WebSocket the container dials home (animus-env-transport), and deletes the service on teardown."
 
@@ -149,6 +149,11 @@ required = false
 [[env]]
 key = "CODEX_OAUTH_HOME"
 description = "Daemon-side dir with the Codex ChatGPT-subscription auth.json; base64-injected into each node so the codex harness runs on the subscription."
+required = false
+
+[[env]]
+key = "KIMI_CODE_HOME"
+description = "Daemon-side dir with the Kimi Code config.toml and credentials/kimi-code.json; bundled base64-injected into each node so the kimi harness runs on the shared login. Defaults to the durable portal path /data/animus-state/kimi-config when unset."
 required = false
 
 [[env]]

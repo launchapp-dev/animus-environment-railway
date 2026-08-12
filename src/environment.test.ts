@@ -33,10 +33,13 @@ import {
   DEFAULT_CODEX_OAUTH_HOME,
   DEFAULT_CLAUDE_CONFIG_DIR,
   DEFAULT_IMAGE,
+  DEFAULT_KIMI_CODE_HOME,
   DEFAULT_MAX_MANAGED_NODES,
   deterministicServiceName,
   githubAppCredentials,
   harnessCredentialVars,
+  kimiConfigDir,
+  kimiNodeBundle,
   logStorageEnv,
   actorBinding,
   makeActorBoundReverseHandler,
@@ -387,6 +390,58 @@ describe('pure helpers', () => {
 
   it('harnessCredentialVars skips missing creds (best-effort)', () => {
     expect(harnessCredentialVars({ CODEX_OAUTH_HOME: '/nonexistent-codex-home' } as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('kimiNodeBundle emits the exact JSON bundle when both files exist', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-'));
+    writeFileSync(join(dir, 'config.toml'), 'model = "k3"\n');
+    mkdirSync(join(dir, 'credentials'), { recursive: true });
+    writeFileSync(join(dir, 'credentials', 'kimi-code.json'), '{"token":"k"}');
+    const vars = kimiNodeBundle({ KIMI_CODE_HOME: dir } as NodeJS.ProcessEnv);
+    const decoded = JSON.parse(Buffer.from(vars.ANIMUS_NODE_KIMI_BUNDLE_B64, 'base64').toString('utf8'));
+    expect(decoded).toEqual({
+      files: {
+        'config.toml': 'model = "k3"\n',
+        'credentials/kimi-code.json': '{"token":"k"}',
+      },
+    });
+  });
+
+  it('kimiNodeBundle includes only the files that exist', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-'));
+    writeFileSync(join(dir, 'config.toml'), 'model = "k3"\n');
+    const vars = kimiNodeBundle({ KIMI_CODE_HOME: dir } as NodeJS.ProcessEnv);
+    const decoded = JSON.parse(Buffer.from(vars.ANIMUS_NODE_KIMI_BUNDLE_B64, 'base64').toString('utf8'));
+    expect(decoded).toEqual({ files: { 'config.toml': 'model = "k3"\n' } });
+  });
+
+  it('kimiNodeBundle injects nothing when the dir or files are absent', () => {
+    expect(kimiNodeBundle({ KIMI_CODE_HOME: '/nonexistent-kimi-home' } as NodeJS.ProcessEnv)).toEqual({});
+    // dir exists but holds neither bundle file
+    const empty = mkdtempSync(join(tmpdir(), 'kimi-empty-'));
+    expect(kimiNodeBundle({ KIMI_CODE_HOME: empty } as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('kimiConfigDir resolves the durable portal fallback only when the env is unset', () => {
+    const explicit = mkdtempSync(join(tmpdir(), 'kimi-explicit-'));
+    expect(DEFAULT_KIMI_CODE_HOME).toBe('/data/animus-state/kimi-config');
+    expect(kimiConfigDir({} as NodeJS.ProcessEnv)).toBe(DEFAULT_KIMI_CODE_HOME);
+    expect(kimiConfigDir({ KIMI_CODE_HOME: explicit } as NodeJS.ProcessEnv)).toBe(explicit);
+    expect(kimiConfigDir({ KIMI_CODE_HOME: '' } as NodeJS.ProcessEnv)).toBeNull();
+  });
+
+  it('harnessCredentialVars includes the kimi bundle alongside codex auth', () => {
+    const codexDir = mkdtempSync(join(tmpdir(), 'codex-'));
+    writeFileSync(join(codexDir, 'auth.json'), '{"tokens":"x"}');
+    const kimiDir = mkdtempSync(join(tmpdir(), 'kimi-'));
+    mkdirSync(join(kimiDir, 'credentials'), { recursive: true });
+    writeFileSync(join(kimiDir, 'credentials', 'kimi-code.json'), '{"token":"k"}');
+    const vars = harnessCredentialVars({
+      CODEX_OAUTH_HOME: codexDir,
+      KIMI_CODE_HOME: kimiDir,
+    } as NodeJS.ProcessEnv);
+    const decoded = JSON.parse(Buffer.from(vars.ANIMUS_NODE_KIMI_BUNDLE_B64, 'base64').toString('utf8'));
+    expect(decoded).toEqual({ files: { 'credentials/kimi-code.json': '{"token":"k"}' } });
   });
 
   it('claudeNodeCredentials injects a valid token as-is with the refresh token STRIPPED', async () => {
