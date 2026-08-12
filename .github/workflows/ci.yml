@@ -19,6 +19,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The default GITHUB_TOKEN's Authorization extraheader is scoped to
+          # THIS repository and 404s the private dependencies; the dependency
+          # token minted below carries that auth instead.
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
@@ -61,6 +66,7 @@ jobs:
             "ssh://git@github.com/launchapp-dev/animus-environment-base.git"
           git config --global url."https://x-access-token:${DEPENDENCY_TOKEN}@github.com/launchapp-dev/animus-env-transport.git".insteadOf \
             "ssh://git@github.com/launchapp-dev/animus-env-transport.git"
+          git config --global --unset-all http."https://github.com/".extraheader || true
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
       - run: npm ci
