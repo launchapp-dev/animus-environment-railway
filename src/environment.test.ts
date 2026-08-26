@@ -40,6 +40,7 @@ import {
   harnessCredentialVars,
   kimiConfigDir,
   kimiNodeBundle,
+  kimiNodeCredentials,
   logStorageEnv,
   actorBinding,
   makeActorBoundReverseHandler,
@@ -420,6 +421,66 @@ describe('pure helpers', () => {
     // dir exists but holds neither bundle file
     const empty = mkdtempSync(join(tmpdir(), 'kimi-empty-'));
     expect(kimiNodeBundle({ KIMI_CODE_HOME: empty } as NodeJS.ProcessEnv)).toEqual({});
+  });
+
+  it('kimiNodeCredentials refreshes a near-expiry bundle centrally and strips the refresh token', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-refresh-'));
+    writeFileSync(join(dir, 'config.toml'), 'model = "k3"\n');
+    mkdirSync(join(dir, 'credentials'), { recursive: true });
+    const now = 1_800_000_000_000;
+    const expired = {
+      access_token: 'old-access',
+      refresh_token: 'old-refresh',
+      expires_at: Math.floor((now - 60_000) / 1000),
+      expires_in: 900,
+      scope: 's',
+      token_type: 'bearer',
+    };
+    writeFileSync(join(dir, 'credentials', 'kimi-code.json'), JSON.stringify(expired));
+
+    const fetchImpl = (async (url: unknown, init: unknown) => {
+      const body = String((init as { body?: string }).body ?? '');
+      expect(body).toContain('old-refresh');
+      return new Response(JSON.stringify({ access_token: 'fresh-access', refresh_token: 'fresh-refresh', expires_in: 900 }), { status: 200 });
+    }) as typeof fetch;
+
+    const vars = await kimiNodeCredentials({ KIMI_CODE_HOME: dir } as NodeJS.ProcessEnv, now, fetchImpl);
+    const decoded = JSON.parse(Buffer.from(vars.ANIMUS_NODE_KIMI_BUNDLE_B64, 'base64').toString('utf8'));
+    const nodeCreds = JSON.parse(decoded.files['credentials/kimi-code.json']);
+    expect(nodeCreds.access_token).toBe('fresh-access');
+    expect(nodeCreds.refresh_token).toBeUndefined();
+
+    // The daemon-side store absorbed the rotation (next prepare starts fresh).
+    const stored = JSON.parse(readFileSync(join(dir, 'credentials', 'kimi-code.json'), 'utf8'));
+    expect(stored.access_token).toBe('fresh-access');
+    expect(stored.refresh_token).toBe('fresh-refresh');
+  });
+
+  it('kimiNodeCredentials injects the current bundle (refresh-stripped) when the token is still valid', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-valid-'));
+    writeFileSync(join(dir, 'config.toml'), 'model = "k3"\n');
+    mkdirSync(join(dir, 'credentials'), { recursive: true });
+    const now = 1_800_000_000_000;
+    writeFileSync(join(dir, 'credentials', 'kimi-code.json'), JSON.stringify({
+      access_token: 'valid-access',
+      refresh_token: 'valid-refresh',
+      expires_at: Math.floor((now + 3_600_000) / 1000),
+      expires_in: 3600,
+    }));
+    const fetchImpl = (async () => { throw new Error('must not refresh a valid token'); }) as typeof fetch;
+    const vars = await kimiNodeCredentials({ KIMI_CODE_HOME: dir } as NodeJS.ProcessEnv, now, fetchImpl);
+    const decoded = JSON.parse(Buffer.from(vars.ANIMUS_NODE_KIMI_BUNDLE_B64, 'base64').toString('utf8'));
+    const nodeCreds = JSON.parse(decoded.files['credentials/kimi-code.json']);
+    expect(nodeCreds.access_token).toBe('valid-access');
+    expect(nodeCreds.refresh_token).toBeUndefined();
+  });
+
+  it('kimiNodeCredentials returns {} on refresh failure or missing tokens', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kimi-dead-'));
+    mkdirSync(join(dir, 'credentials'), { recursive: true });
+    writeFileSync(join(dir, 'credentials', 'kimi-code.json'), JSON.stringify({ access_token: 'x', expires_at: 1 }));
+    const vars = await kimiNodeCredentials({ KIMI_CODE_HOME: dir } as NodeJS.ProcessEnv, Date.now());
+    expect(vars).toEqual({});
   });
 
   it('kimiConfigDir resolves the durable portal fallback only when the env is unset', () => {

@@ -828,6 +828,128 @@ export function kimiNodeBundle(
   return { ANIMUS_NODE_KIMI_BUNDLE_B64: Buffer.from(JSON.stringify({ files }), 'utf8').toString('base64') };
 }
 
+/** Central Kimi-subscription refresher (TASK-1342) — mirrors
+ *  claudeNodeCredentials' posture. Kimi access tokens live ~15 minutes and the
+ *  node CLI never refreshes, so a bundle baked from the static dir is dead
+ *  within minutes of node boot. The daemon refreshes at PREPARE time (single
+ *  writer — the Portal capacity lock owns rotation), writes the rotation back
+ *  so the next prepare stays fresh, and injects the node bundle with the
+ *  refresh token STRIPPED (the node cannot rotate or corrupt the shared
+ *  credential). Best-effort: returns the static bundle when refresh fails, {}
+ *  when no login exists. */
+export async function kimiNodeCredentials(
+  hostEnv: NodeJS.ProcessEnv,
+  now: number,
+  fetchImpl: typeof fetch = fetch,
+  defaultDir: string = DEFAULT_KIMI_CODE_HOME,
+): Promise<Record<string, string>> {
+  const dir = kimiConfigDir(hostEnv, defaultDir);
+  if (!dir) return {};
+  const credPath = `${dir}/credentials/kimi-code.json`;
+  let creds: Record<string, unknown>;
+  try {
+    creds = JSON.parse(readFileSync(credPath, 'utf8')) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+  const accessToken = typeof creds.access_token === 'string' ? creds.access_token.trim() : '';
+  const refreshToken = typeof creds.refresh_token === 'string' ? creds.refresh_token.trim() : '';
+  const expiresAt = Number(creds.expires_at ?? 0);
+  if (accessToken && expiresAt * 1000 - now > 60_000) {
+    // Still valid: inject the current bundle (refresh token stripped below).
+    return kimiNodeBundleStripped(hostEnv, defaultDir);
+  }
+  if (!refreshToken) {
+    process.stderr.write(
+      '[animus-environment-railway] kimi credential has no usable access or refresh token; node will lack kimi auth\n',
+    );
+    return {};
+  }
+  const tokenUrl = (hostEnv.KIMI_OAUTH_TOKEN_URL ?? 'https://auth.kimi.com/api/oauth/token').trim();
+  const clientId = (hostEnv.KIMI_OAUTH_CLIENT_ID ?? '17e5f671-d194-4dfb-9706-5516cb48c098').trim();
+  try {
+    const res = await fetchImpl(tokenUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: clientId,
+      }).toString(),
+    });
+    if (!res.ok) {
+      process.stderr.write(
+        `[animus-environment-railway] kimi token refresh failed (HTTP ${res.status}); node will lack kimi auth\n`,
+      );
+      return {};
+    }
+    const t = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
+    if (typeof t.access_token !== 'string' || t.access_token.trim() === '') {
+      process.stderr.write(
+        '[animus-environment-railway] kimi token refresh returned no access token; node will lack kimi auth\n',
+      );
+      return {};
+    }
+    const rotated = {
+      ...creds,
+      access_token: t.access_token,
+      refresh_token: typeof t.refresh_token === 'string' && t.refresh_token ? t.refresh_token : refreshToken,
+      expires_at: Math.floor((now + Number(t.expires_in ?? 900) * 1000) / 1000),
+      expires_in: Number(t.expires_in ?? 900),
+    };
+    // Write the rotation back so the next prepare starts fresh.
+    try {
+      writeFileSync(credPath, JSON.stringify(rotated), { mode: 0o600 });
+    } catch {
+      // /data read-only in some environments; the injected token is still fresh
+    }
+    return kimiNodeBundleStripped(hostEnv, defaultDir, rotated);
+  } catch (err) {
+    process.stderr.write(`[animus-environment-railway] kimi token refresh error: ${String(err)}\n`);
+    return {};
+  }
+}
+
+/** Bundle the daemon-side Kimi files with the credentials' refresh token
+ *  stripped — the node must never hold the single-use refresh token. When
+ *  `rotated` is provided (a fresh prepare-time rotation), it is used instead of
+ *  re-reading the credentials file. */
+function kimiNodeBundleStripped(
+  hostEnv: NodeJS.ProcessEnv,
+  defaultDir: string,
+  rotated?: Record<string, unknown>,
+): Record<string, string> {
+  const dir = kimiConfigDir(hostEnv, defaultDir);
+  if (!dir) return {};
+  const files: Record<string, string> = {};
+  for (const rel of KIMI_BUNDLE_FILES) {
+    if (rotated && rel === 'credentials/kimi-code.json') {
+      const { refresh_token: _r, ...noRefresh } = rotated;
+      files[rel] = JSON.stringify(noRefresh);
+      continue;
+    }
+    try {
+      const content = readFileSync(`${dir}/${rel}`, 'utf8');
+      if (rel === 'credentials/kimi-code.json') {
+        try {
+          const parsed = JSON.parse(content) as Record<string, unknown>;
+          const { refresh_token: _r, ...noRefresh } = parsed;
+          files[rel] = JSON.stringify(noRefresh);
+          continue;
+        } catch {
+          // unparseable credentials file: skip rather than inject garbage
+          continue;
+        }
+      }
+      files[rel] = content;
+    } catch {
+      // file absent; skip
+    }
+  }
+  if (Object.keys(files).length === 0) return {};
+  return { ANIMUS_NODE_KIMI_BUNDLE_B64: Buffer.from(JSON.stringify({ files }), 'utf8').toString('base64') };
+}
+
 /** Central Claude-subscription refresher. A node must NEVER hold the refresh
  *  token: the claude CLI rotates it single-use, and since a node's rotation is
  *  lost (never written back to the daemon), a refreshing node would corrupt the
@@ -1696,6 +1818,10 @@ export class RailwayEnvironment {
     // Central Claude refresh: inject a short-lived access token (refresh token
     // stripped) so the node can't rotate/corrupt the shared daemon credential.
     const claudeVars = await claudeNodeCredentials(process.env, Date.now());
+    // Central Kimi refresh (TASK-1342): same posture — Kimi tokens live ~15
+    // minutes, so the node gets a freshly-minted access token with the refresh
+    // token stripped, and the daemon-side store absorbs the rotation.
+    const kimiVars = await kimiNodeCredentials(process.env, Date.now());
     try {
       const created = await this.createWithinCapacity({
         projectId,
@@ -1706,6 +1832,7 @@ export class RailwayEnvironment {
         variables: {
           ...runVariables({ wssUrl: url, token, specEnv: spec.env, actorJson: binding.actorJson }),
           ...claudeVars,
+          ...kimiVars,
           ...appVars,
         },
       });
