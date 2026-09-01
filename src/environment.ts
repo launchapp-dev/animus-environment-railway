@@ -838,23 +838,25 @@ const kimiCredentialRefreshes = new Map<string, Promise<Record<string, unknown> 
 
 /** Central Kimi-subscription refresher (TASK-1342, exposed for the node
  *  `kimi/token` servicer in TASK-1420). Returns the daemon-side Kimi
- *  credential with a usable access token: still-valid tokens are returned
- *  as-is; near-expiry tokens are refreshed centrally and the rotation is
- *  written back so the next reader starts fresh. Returns null when there is
- *  no usable login or the refresh fails. Concurrent callers for the same
- *  store share one in-flight refresh. Never logs credential material. */
+ *  credential with a usable access token: tokens with more than `minTtlMs`
+ *  of life left are returned as-is; nearer-expiry tokens are refreshed
+ *  centrally and the rotation is written back so the next reader starts
+ *  fresh. Returns null when there is no usable login or the refresh fails.
+ *  Concurrent callers for the same store share one in-flight refresh. Never
+ *  logs credential material. */
 export function freshKimiNodeCredential(
   hostEnv: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: typeof fetch = fetch,
   defaultDir: string = DEFAULT_KIMI_CODE_HOME,
+  minTtlMs = 60_000,
 ): Promise<Record<string, unknown> | null> {
   const dir = kimiConfigDir(hostEnv, defaultDir);
   if (!dir) return Promise.resolve(null);
   const key = `${dir}/credentials/kimi-code.json`;
   const existing = kimiCredentialRefreshes.get(key);
   if (existing) return existing;
-  const promise = refreshKimiNodeCredential(dir, hostEnv, now, fetchImpl).finally(() => {
+  const promise = refreshKimiNodeCredential(dir, hostEnv, now, fetchImpl, minTtlMs).finally(() => {
     if (kimiCredentialRefreshes.get(key) === promise) kimiCredentialRefreshes.delete(key);
   });
   kimiCredentialRefreshes.set(key, promise);
@@ -866,6 +868,7 @@ async function refreshKimiNodeCredential(
   hostEnv: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: typeof fetch,
+  minTtlMs: number,
 ): Promise<Record<string, unknown> | null> {
   const credPath = `${dir}/credentials/kimi-code.json`;
   let creds: Record<string, unknown>;
@@ -877,7 +880,7 @@ async function refreshKimiNodeCredential(
   const accessToken = typeof creds.access_token === 'string' ? creds.access_token.trim() : '';
   const refreshToken = typeof creds.refresh_token === 'string' ? creds.refresh_token.trim() : '';
   const expiresAt = Number(creds.expires_at ?? 0);
-  if (accessToken && expiresAt * 1000 - now > 60_000) {
+  if (accessToken && expiresAt * 1000 - now > minTtlMs) {
     // Still valid: serve the stored credential (refresh token stripped by callers).
     return creds;
   }

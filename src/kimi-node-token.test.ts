@@ -105,6 +105,25 @@ describe('makeKimiNodeTokenServicer', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('refreshes a token the daemon still considers valid but the node CLI would not (min TTL)', async () => {
+    // 400s remaining: above the prepare-time 60s validity bar, below the CLI's
+    // own 450s stale threshold — the servicer must mint a fresh one anyway.
+    const now = Date.now();
+    const dir = kimiStore({
+      ...validCredential(now),
+      expires_at: Math.floor((now + 400_000) / 1000),
+      expires_in: 900,
+    });
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ access_token: 'fresh-access', refresh_token: 'fresh-refresh', expires_in: 900 }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = (await servicerFor(dir).call(KIMI_TOKEN_METHOD, {})) as { credential: Record<string, unknown> };
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.credential.access_token).toBe('fresh-access');
+    expect(Number(result.credential.expires_at) * 1000 - now).toBeGreaterThan(450_000);
+    expect(result.credential.refresh_token).toBeUndefined();
+  });
+
   it('fails the call (not the run) when no usable credential exists', async () => {
     const dir = kimiStore({ access_token: 'x', expires_at: 1 });
     await expect(servicerFor(dir).call(KIMI_TOKEN_METHOD, {})).rejects.toMatchObject({
