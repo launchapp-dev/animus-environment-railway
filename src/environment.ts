@@ -117,6 +117,7 @@ import {
 } from './railway.js';
 import { makeCredentialsServicer } from './credentials-servicer.js';
 import { makeKimiNodeTokenServicer } from './kimi-node-token.js';
+import { capacityNodeBundle } from './capacity-broker.js';
 
 // Short, Railway-valid service-name token. This is cosmetic substrate naming,
 // never an authorization identifier.
@@ -943,13 +944,22 @@ async function refreshKimiNodeCredential(
  *  rotate or corrupt the shared credential). Mid-run expiry is covered by the
  *  node pulling a fresh access token over the relay (`credentials` role,
  *  `kimi/token` — TASK-1420). Best-effort: returns {} when there is no usable
- *  login or refresh fails. */
+ *  login or refresh fails.
+ *
+ *  When the daemon injects CAPACITY_BROKER_URL + CAPACITY_BROKER_TOKEN, the
+ *  bundle is sourced from the Portal's locked single-writer credential-refresh
+ *  endpoint (family-only, refresh-stripped server-side) instead of the local
+ *  file refresh, which races that writer's single-use rotation. */
 export async function kimiNodeCredentials(
   hostEnv: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: typeof fetch = fetch,
   defaultDir: string = DEFAULT_KIMI_CODE_HOME,
 ): Promise<Record<string, string>> {
+  const brokerBundle = await capacityNodeBundle(hostEnv, 'kimi', fetchImpl);
+  if (brokerBundle) {
+    return { ANIMUS_NODE_KIMI_BUNDLE_B64: Buffer.from(brokerBundle, 'utf8').toString('base64') };
+  }
   const creds = await freshKimiNodeCredential(hostEnv, now, fetchImpl, defaultDir);
   if (!creds) return {};
   return kimiNodeBundleStripped(hostEnv, defaultDir, creds);
@@ -1003,13 +1013,24 @@ function kimiNodeBundleStripped(
  *  (writing the rotated token back), then injects only a short-lived access token
  *  with the refresh token STRIPPED. The node uses that access token directly and
  *  cannot rotate anything. Best-effort: returns {} when there is no usable
- *  login or refresh fails, allowing the node to use its Anthropic API fallback. */
+ *  login or refresh fails, allowing the node to use its Anthropic API fallback.
+ *
+ *  When the daemon injects CAPACITY_BROKER_URL + CAPACITY_BROKER_TOKEN, the
+ *  bundle is instead sourced from the Portal's locked single-writer
+ *  credential-refresh endpoint (family-only, already refresh-stripped) — the
+ *  local refresh below races that writer (single-use rotation) and its default
+ *  endpoint (console.anthropic.com) is Cloudflare-challenged from datacenter
+ *  IPs, so the broker path is authoritative when available (TASK-1420). */
 export async function claudeNodeCredentials(
   hostEnv: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: typeof fetch = fetch,
   defaultConfigDir: string = DEFAULT_CLAUDE_CONFIG_DIR,
 ): Promise<Record<string, string>> {
+  const brokerBundle = await capacityNodeBundle(hostEnv, 'claude', fetchImpl);
+  if (brokerBundle) {
+    return { ANIMUS_NODE_CLAUDE_CREDENTIALS_B64: Buffer.from(brokerBundle, 'utf8').toString('base64') };
+  }
   const dir = claudeConfigDir(hostEnv, defaultConfigDir);
   if (!dir) return {};
   const path = `${dir}/.credentials.json`;
