@@ -143,6 +143,26 @@ describe('makeScopedBackendCallAuthorizer', () => {
     ).rejects.toMatchObject({ code: RelayErrorCode.BackendCallForbidden });
   });
 
+  it('allows kimi/token with no node-controlled params and rejects other credential methods', async () => {
+    // The parent serves the bound run a fresh access-token-only Kimi
+    // credential; attacker-supplied params are dropped, not forwarded.
+    await expect(call('credentials', 'kimi/token', { family: 'other', credentialId: 'x' })).resolves.toEqual({
+      params: {},
+    });
+    await expect(call('credentials', 'kimi/token')).resolves.toEqual({ params: {} });
+    await expect(call('credentials', 'kimi/refresh_token')).rejects.toMatchObject({
+      code: RelayErrorCode.BackendCallForbidden,
+    });
+    await expect(call('credentials', 'admin/dump')).rejects.toMatchObject({
+      code: RelayErrorCode.BackendCallForbidden,
+    });
+    // Role confusion stays closed: kimi/token under a non-credentials role is
+    // not routed to the credentials authorizer.
+    await expect(call('subject_backend', 'kimi/token', {})).rejects.toMatchObject({
+      code: RelayErrorCode.BackendCallForbidden,
+    });
+  });
+
   it('denies role confusion, the parent queue, unknown methods, and unknown handles', async () => {
     await expect(call('config_source', 'subject/get', { id: 'TASK-724' })).rejects.toMatchObject({
       code: RelayErrorCode.BackendCallForbidden,
