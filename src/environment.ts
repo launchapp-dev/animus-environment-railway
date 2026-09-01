@@ -116,6 +116,7 @@ import {
   type RailwayApi,
 } from './railway.js';
 import { makeCredentialsServicer } from './credentials-servicer.js';
+import { makeKimiNodeTokenServicer } from './kimi-node-token.js';
 
 // Short, Railway-valid service-name token. This is cosmetic substrate naming,
 // never an authorization identifier.
@@ -828,42 +829,63 @@ export function kimiNodeBundle(
   return { ANIMUS_NODE_KIMI_BUNDLE_B64: Buffer.from(JSON.stringify({ files }), 'utf8').toString('base64') };
 }
 
-/** Central Kimi-subscription refresher (TASK-1342) — mirrors
- *  claudeNodeCredentials' posture. Kimi access tokens live ~15 minutes and the
- *  node CLI never refreshes, so a bundle baked from the static dir is dead
- *  within minutes of node boot. The daemon refreshes at PREPARE time (single
- *  writer — the Portal capacity lock owns rotation), writes the rotation back
- *  so the next prepare stays fresh, and injects the node bundle with the
- *  refresh token STRIPPED (the node cannot rotate or corrupt the shared
- *  credential). Best-effort: returns the static bundle when refresh fails, {}
- *  when no login exists. */
-export async function kimiNodeCredentials(
+/** In-flight Kimi credential refreshes keyed by credentials-file path. The
+ *  daemon is the single writer of the shared Kimi login (single-use
+ *  refresh_token rotation), so a prepare and a node `kimi/token` reverse call
+ *  — or two concurrent runs — must never race independent refreshes of the
+ *  same store: every consumer coalesces onto one in-flight refresh. */
+const kimiCredentialRefreshes = new Map<string, Promise<Record<string, unknown> | null>>();
+
+/** Central Kimi-subscription refresher (TASK-1342, exposed for the node
+ *  `kimi/token` servicer in TASK-1420). Returns the daemon-side Kimi
+ *  credential with a usable access token: still-valid tokens are returned
+ *  as-is; near-expiry tokens are refreshed centrally and the rotation is
+ *  written back so the next reader starts fresh. Returns null when there is
+ *  no usable login or the refresh fails. Concurrent callers for the same
+ *  store share one in-flight refresh. Never logs credential material. */
+export function freshKimiNodeCredential(
   hostEnv: NodeJS.ProcessEnv,
   now: number,
   fetchImpl: typeof fetch = fetch,
   defaultDir: string = DEFAULT_KIMI_CODE_HOME,
-): Promise<Record<string, string>> {
+): Promise<Record<string, unknown> | null> {
   const dir = kimiConfigDir(hostEnv, defaultDir);
-  if (!dir) return {};
+  if (!dir) return Promise.resolve(null);
+  const key = `${dir}/credentials/kimi-code.json`;
+  const existing = kimiCredentialRefreshes.get(key);
+  if (existing) return existing;
+  const promise = refreshKimiNodeCredential(dir, hostEnv, now, fetchImpl).finally(() => {
+    if (kimiCredentialRefreshes.get(key) === promise) kimiCredentialRefreshes.delete(key);
+  });
+  kimiCredentialRefreshes.set(key, promise);
+  return promise;
+}
+
+async function refreshKimiNodeCredential(
+  dir: string,
+  hostEnv: NodeJS.ProcessEnv,
+  now: number,
+  fetchImpl: typeof fetch,
+): Promise<Record<string, unknown> | null> {
   const credPath = `${dir}/credentials/kimi-code.json`;
   let creds: Record<string, unknown>;
   try {
     creds = JSON.parse(readFileSync(credPath, 'utf8')) as Record<string, unknown>;
   } catch {
-    return {};
+    return null;
   }
   const accessToken = typeof creds.access_token === 'string' ? creds.access_token.trim() : '';
   const refreshToken = typeof creds.refresh_token === 'string' ? creds.refresh_token.trim() : '';
   const expiresAt = Number(creds.expires_at ?? 0);
   if (accessToken && expiresAt * 1000 - now > 60_000) {
-    // Still valid: inject the current bundle (refresh token stripped below).
-    return kimiNodeBundleStripped(hostEnv, defaultDir);
+    // Still valid: serve the stored credential (refresh token stripped by callers).
+    return creds;
   }
   if (!refreshToken) {
     process.stderr.write(
       '[animus-environment-railway] kimi credential has no usable access or refresh token; node will lack kimi auth\n',
     );
-    return {};
+    return null;
   }
   const tokenUrl = (hostEnv.KIMI_OAUTH_TOKEN_URL ?? 'https://auth.kimi.com/api/oauth/token').trim();
   const clientId = (hostEnv.KIMI_OAUTH_CLIENT_ID ?? '17e5f671-d194-4dfb-9706-5516cb48c098').trim();
@@ -881,14 +903,14 @@ export async function kimiNodeCredentials(
       process.stderr.write(
         `[animus-environment-railway] kimi token refresh failed (HTTP ${res.status}); node will lack kimi auth\n`,
       );
-      return {};
+      return null;
     }
     const t = (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
     if (typeof t.access_token !== 'string' || t.access_token.trim() === '') {
       process.stderr.write(
         '[animus-environment-railway] kimi token refresh returned no access token; node will lack kimi auth\n',
       );
-      return {};
+      return null;
     }
     const rotated = {
       ...creds,
@@ -897,17 +919,37 @@ export async function kimiNodeCredentials(
       expires_at: Math.floor((now + Number(t.expires_in ?? 900) * 1000) / 1000),
       expires_in: Number(t.expires_in ?? 900),
     };
-    // Write the rotation back so the next prepare starts fresh.
+    // Write the rotation back so the next prepare/serve starts fresh.
     try {
       writeFileSync(credPath, JSON.stringify(rotated), { mode: 0o600 });
     } catch {
-      // /data read-only in some environments; the injected token is still fresh
+      // /data read-only in some environments; the served token is still fresh
     }
-    return kimiNodeBundleStripped(hostEnv, defaultDir, rotated);
+    return rotated;
   } catch (err) {
     process.stderr.write(`[animus-environment-railway] kimi token refresh error: ${String(err)}\n`);
-    return {};
+    return null;
   }
+}
+
+/** Prepare-time Kimi bundle for node injection (TASK-1342) — mirrors
+ *  claudeNodeCredentials' posture. Kimi access tokens live ~15 minutes, so a
+ *  bundle baked from the static dir is dead within minutes of node boot; the
+ *  daemon refreshes centrally (single writer), writes the rotation back, and
+ *  injects the node bundle with the refresh token STRIPPED (the node cannot
+ *  rotate or corrupt the shared credential). Mid-run expiry is covered by the
+ *  node pulling a fresh access token over the relay (`credentials` role,
+ *  `kimi/token` — TASK-1420). Best-effort: returns {} when there is no usable
+ *  login or refresh fails. */
+export async function kimiNodeCredentials(
+  hostEnv: NodeJS.ProcessEnv,
+  now: number,
+  fetchImpl: typeof fetch = fetch,
+  defaultDir: string = DEFAULT_KIMI_CODE_HOME,
+): Promise<Record<string, string>> {
+  const creds = await freshKimiNodeCredential(hostEnv, now, fetchImpl, defaultDir);
+  if (!creds) return {};
+  return kimiNodeBundleStripped(hostEnv, defaultDir, creds);
 }
 
 /** Bundle the daemon-side Kimi files with the credentials' refresh token
@@ -1717,7 +1759,10 @@ export class RailwayEnvironment {
       // The `credentials` role serves on-demand GitHub token re-mints for the
       // node's git credential helper (TASK-855) — the trusted handle policy
       // binds each mint to one repository, and the App private key never
-      // crosses the relay. Wired alongside the backend passthrough only.
+      // crosses the relay — plus `kimi/token` (TASK-1420): the node pulls a
+      // fresh access-token-only Kimi credential mid-run when its injected
+      // token nears expiry, served by the same central refresh prepare uses.
+      // Wired alongside the backend passthrough only.
       this.relayInstance = await RelayClient.connect({
         socketPath: this.config.relaySocketPath,
         actorId: this.config.relayOwnerId?.trim() || 'animus-environment-railway',
@@ -1730,7 +1775,7 @@ export class RailwayEnvironment {
                   {
                     default: backend,
                     ...(logBackend ? { log_storage: logBackend } : {}),
-                    credentials: makeCredentialsServicer(process.env),
+                    credentials: makeKimiNodeTokenServicer(makeCredentialsServicer(process.env), process.env),
                   },
                   {
                     authorize: makeScopedBackendCallAuthorizer(this.backendCallScopes),

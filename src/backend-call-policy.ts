@@ -197,9 +197,17 @@ function authorizeConfig(request: BackendCallAuthorizationRequest): { params: un
 
 function authorizeCredentials(request: BackendCallAuthorizationRequest, scope: BackendCallScope): { params: unknown } {
   requireRole(request, ['credentials']);
-  if (request.method !== 'git/token') deny(`credentials method '${request.method}' is not allowlisted`);
-  if (!scope.repository) deny('git/token requires a repository-bound handle');
-  return { params: { owner: scope.repository.owner, repo: scope.repository.repo } };
+  if (request.method === 'git/token') {
+    if (!scope.repository) deny('git/token requires a repository-bound handle');
+    return { params: { owner: scope.repository.owner, repo: scope.repository.repo } };
+  }
+  if (request.method === 'kimi/token') {
+    // The node supplies nothing: the parent serves the bound run a fresh
+    // access-token-only Kimi credential from the daemon-side store. Any
+    // node-controlled params are dropped here rather than forwarded.
+    return { params: {} };
+  }
+  deny(`credentials method '${request.method}' is not allowlisted`);
 }
 
 /** Build the concrete Railway node policy. It is intentionally a closed
