@@ -308,6 +308,17 @@ const plugin = defineEnvironmentPlugin({
   health: () => env.health(),
 });
 
+// Reattach relay runs the singleton kept registered across our restart
+// (TASK-1420): a previous plugin process may have died (daemon redeploy /
+// runtime activation) while node sessions were live. Without this eager boot
+// hook, those handles only reattach if a fresh exec_session call happens to
+// arrive, and the nodes' reverse RPC (backend/call, kimi/token, credential
+// re-mints) times out for the rest of the run. Failure is logged inside and
+// here, never fatal — the per-call reattach in runSession remains.
+void env.restoreRelayRuns().catch((err) => {
+  process.stderr.write(`[animus-environment-railway] relay startup reattach failed: ${String(err)}\n`);
+});
+
 // The daemon/runner that spawned us owns our lifecycle over stdio: when it
 // closes our stdin (shutdown RPC / eviction / parent exit) `plugin.run()`
 // resolves. Our in-process RelayServer's listening socket would otherwise keep

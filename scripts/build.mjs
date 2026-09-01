@@ -6,7 +6,10 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const outfile = join(root, 'dist', 'animus-environment-railway');
-const expectedTransportVersion = '0.3.4';
+// Pinned to the transport commit carrying startup-reattach support
+// (TASK-1420). The release step re-pins package.json to the v0.3.7 tag and
+// bumps this expectation to match that tag's package version.
+const expectedTransportVersion = '0.3.6';
 const expectedEnvironmentBaseCommit = '56a370a2bf622ef009e90f2004353b89f8a7ad4c';
 const transportPackage = JSON.parse(
   readFileSync(

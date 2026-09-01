@@ -44,6 +44,8 @@ import {
   RelayErrorCode,
   RelayRpcError,
   ExecutionFenceSchema,
+  type RelayListedRun,
+  type RelayRunScope,
   type RelayServerOptions,
   type ReverseRpcHandler,
   type SessionResult,
@@ -56,18 +58,28 @@ import {
   type BackendCallScope,
 } from './backend-call-policy.js';
 
-/** The relay surface `prepare`/`exec`/`teardown` drive, satisfied by BOTH the
- *  in-process `RelayServer` (tests) and the `RelayClient` that talks to the
- *  shared singleton (production). `registerRun` may be sync or async — callers
- *  `await` it. */
+/** The relay surface `prepare`/`exec`/`teardown` drive, satisfied by the
+ *  `RelayClient` that talks to the shared singleton (production) and by fakes
+ *  in tests. `registerRun` may be sync or async — callers `await` it.
+ *  `listRuns`/`attachRun` power startup reattach; a transport without them
+ *  (legacy in-process relay) simply skips restart recovery. */
 export type RelayTransport = Pick<RelayClient, 'exec' | 'runSession' | 'releaseRun' | 'registeredRuns' | 'close'> & {
-  registerRun(handleId?: string):
+  registerRun(
+    handleId?: string,
+    credentials?: RelayCredentials,
+    scope?: RelayRunScope,
+    attach?: boolean,
+    binding?: string,
+  ):
     | { url: string; token: string; ownerToken?: string }
     | Promise<{ url: string; token: string; ownerToken?: string }>;
   attachRun?: (
     handleId: string,
     credentials: RelayCredentials,
+    scope?: RelayRunScope,
+    binding?: string,
   ) => Promise<{ url: string; token: string; ownerToken: string }>;
+  listRuns?: () => Promise<RelayListedRun[]>;
   // RelayServer returns the connection, RelayClient returns void — callers ignore it.
   waitForConnection(handleId: string, timeoutMs: number): Promise<unknown>;
 };
@@ -217,12 +229,28 @@ function relayBindingKey(secret: string): Buffer {
     .digest();
 }
 
-function sealRelayBinding(secret: string, handleId: string, credentials: RelayCredentials): string {
+/** The sealed relay restart payload: the exact run credentials plus the
+ * restart-safe authority (actor binding + backend scope) a restarted plugin
+ * process rehydrates so a live node's reverse RPC is served without waiting
+ * for a fresh exec_session call. The optional fields are absent in handles
+ * sealed before startup reattach existed; such legacy payloads still reattach
+ * the transport but leave reverse-RPC authority to the per-call rehydration
+ * from signed handle metadata. */
+interface RelayBindingPayload {
+  token: string;
+  ownerToken: string;
+  actor_scope?: 'system' | 'actor';
+  actor_fingerprint?: string | null;
+  workflow_id?: string | null;
+  repository?: { owner: string; repo: string } | null;
+}
+
+function sealRelayBinding(secret: string, handleId: string, payload: RelayBindingPayload): string {
   const nonce = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', relayBindingKey(secret), nonce);
   cipher.setAAD(Buffer.from(handleId, 'utf8'));
   const ciphertext = Buffer.concat([
-    cipher.update(JSON.stringify(credentials), 'utf8'),
+    cipher.update(JSON.stringify(payload), 'utf8'),
     cipher.final(),
   ]);
   return [
@@ -233,26 +261,22 @@ function sealRelayBinding(secret: string, handleId: string, credentials: RelayCr
   ].join('.');
 }
 
-function openRelayBinding(secret: string, handle: EnvironmentHandle): RelayCredentials | null {
-  const metadata = handle.metadata as Record<string, unknown> | undefined;
-  const sealed = metadata?.animus_relay_binding;
-  if (sealed === undefined || sealed === null) return null;
-  if (typeof sealed !== 'string') {
-    throw new Error(`environment handle '${handle.id}' has malformed relay binding metadata`);
-  }
+/** Open + authenticate a sealed relay binding. Throws on any malformed or
+ *  tampered field — a partially trusted payload would be worse than none. */
+function openRelayBindingPayload(secret: string, handleId: string, sealed: string): RelayBindingPayload {
   const [version, nonceRaw, ciphertextRaw, tagRaw, ...extra] = sealed.split('.');
   if (version !== 'v1' || !nonceRaw || !ciphertextRaw || !tagRaw || extra.length > 0) {
-    throw new Error(`environment handle '${handle.id}' has malformed relay binding metadata`);
+    throw new Error(`relay binding for handle '${handleId}' is malformed`);
   }
   try {
     const decipher = createDecipheriv('aes-256-gcm', relayBindingKey(secret), Buffer.from(nonceRaw, 'base64url'));
-    decipher.setAAD(Buffer.from(handle.id, 'utf8'));
+    decipher.setAAD(Buffer.from(handleId, 'utf8'));
     decipher.setAuthTag(Buffer.from(tagRaw, 'base64url'));
     const plaintext = Buffer.concat([
       decipher.update(Buffer.from(ciphertextRaw, 'base64url')),
       decipher.final(),
     ]).toString('utf8');
-    const parsed = JSON.parse(plaintext) as Partial<RelayCredentials>;
+    const parsed = JSON.parse(plaintext) as Partial<RelayBindingPayload>;
     if (
       typeof parsed.token !== 'string' ||
       typeof parsed.ownerToken !== 'string' ||
@@ -261,7 +285,57 @@ function openRelayBinding(secret: string, handle: EnvironmentHandle): RelayCrede
     ) {
       throw new Error('invalid relay credentials');
     }
-    return { token: parsed.token, ownerToken: parsed.ownerToken };
+    if (parsed.actor_scope !== undefined && parsed.actor_scope !== 'system' && parsed.actor_scope !== 'actor') {
+      throw new Error('invalid relay binding actor scope');
+    }
+    if (
+      parsed.actor_fingerprint !== undefined &&
+      parsed.actor_fingerprint !== null &&
+      (typeof parsed.actor_fingerprint !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(parsed.actor_fingerprint))
+    ) {
+      throw new Error('invalid relay binding actor fingerprint');
+    }
+    if (
+      parsed.workflow_id !== undefined &&
+      parsed.workflow_id !== null &&
+      typeof parsed.workflow_id !== 'string'
+    ) {
+      throw new Error('invalid relay binding workflow id');
+    }
+    const repository = parsed.repository;
+    if (
+      repository !== undefined &&
+      repository !== null &&
+      (typeof repository !== 'object' ||
+        Array.isArray(repository) ||
+        typeof repository.owner !== 'string' ||
+        typeof repository.repo !== 'string')
+    ) {
+      throw new Error('invalid relay binding repository scope');
+    }
+    return {
+      token: parsed.token,
+      ownerToken: parsed.ownerToken,
+      ...(parsed.actor_scope !== undefined ? { actor_scope: parsed.actor_scope } : {}),
+      ...(parsed.actor_fingerprint !== undefined ? { actor_fingerprint: parsed.actor_fingerprint } : {}),
+      ...(parsed.workflow_id !== undefined ? { workflow_id: parsed.workflow_id } : {}),
+      ...(parsed.repository !== undefined ? { repository: parsed.repository } : {}),
+    };
+  } catch {
+    throw new Error(`relay binding for handle '${handleId}' could not be authenticated`);
+  }
+}
+
+function openRelayBinding(secret: string, handle: EnvironmentHandle): RelayCredentials | null {
+  const metadata = handle.metadata as Record<string, unknown> | undefined;
+  const sealed = metadata?.animus_relay_binding;
+  if (sealed === undefined || sealed === null) return null;
+  if (typeof sealed !== 'string') {
+    throw new Error(`environment handle '${handle.id}' has malformed relay binding metadata`);
+  }
+  try {
+    const payload = openRelayBindingPayload(secret, handle.id, sealed);
+    return { token: payload.token, ownerToken: payload.ownerToken };
   } catch {
     throw new Error(`environment handle '${handle.id}' relay binding could not be authenticated`);
   }
@@ -1308,6 +1382,8 @@ export class RailwayEnvironment {
 
   private backendClient: PluginClient | null = null;
   private logClient: PluginClient | null = null;
+  /** One-time startup reattach of the singleton's still-registered runs. */
+  private relayRestore: Promise<void> | null = null;
 
   constructor(deps: RailwayEnvironmentDeps = {}) {
     this.config = deps.config ?? configFromEnv();
@@ -1770,8 +1846,7 @@ export class RailwayEnvironment {
   /** Lazily bind the relay listener (one per plugin process, shared by runs). */
   async relay(): Promise<RelayTransport> {
     if (!this.relayInstance) {
-      const backend = this.backend();
-      const logBackend = this.logBackend();
+      const backend = this.backend();      const logBackend = this.logBackend();
       // Connect to the SHARED singleton relay (animus-env-relay) over its unix
       // socket rather than binding the public port here — one relay owns the
       // fixed port; every plugin instance is a client (no EADDRINUSE, no leaked
@@ -1810,7 +1885,89 @@ export class RailwayEnvironment {
           : {}),
       });
     }
+    await this.ensureRelayRestore(this.relayInstance);
     return this.relayInstance;
+  }
+
+  /** Plugin-boot hook (TASK-1420): connect to the singleton relay and reattach
+   *  every run it still has registered for this owner — without waiting for a
+   *  first prepare/exec call. This is what lets a live node's reverse RPC
+   *  (backend/call, kimi/token, credential re-mints) route to the NEW plugin
+   *  process after a restart instead of timing out for the rest of the run. */
+  async restoreRelayRuns(): Promise<void> {
+    await this.relay();
+  }
+
+  /** Runs the one-time startup reattach exactly once per process; failure is
+   *  logged, never fatal — the per-call reattach in `runSession` remains as
+   *  the fallback path. */
+  private ensureRelayRestore(relay: RelayTransport): Promise<void> {
+    if (!this.relayRestore) {
+      this.relayRestore = this.restoreRegisteredRuns(relay).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[animus-environment-railway] relay startup reattach failed: ${message}\n`);
+      });
+    }
+    return this.relayRestore;
+  }
+
+  /** Enumerate the singleton's still-registered runs for this owner and
+   *  reattach each one, rehydrating restart-safe reverse-RPC authority from
+   *  the AEAD-sealed binding stored with the registration at prepare. Runs
+   *  without a binding (registered before this mechanism existed) are left to
+   *  the per-call `attachRun` path in `runSession`. */
+  private async restoreRegisteredRuns(relay: RelayTransport): Promise<void> {
+    if (!relay.listRuns || !relay.attachRun) return;
+    let runs: RelayListedRun[];
+    try {
+      runs = await relay.listRuns();
+    } catch (err) {
+      // An older singleton never answers `list`; startup reattach is simply
+      // unavailable until the relay is upgraded.
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[animus-environment-railway] relay run listing unavailable: ${message}\n`);
+      return;
+    }
+    for (const run of runs) {
+      if (relay.registeredRuns().includes(run.handleId)) continue;
+      if (!run.binding) continue;
+      let payload: RelayBindingPayload;
+      try {
+        payload = openRelayBindingPayload(this.relayBindingSecret, run.handleId, run.binding);
+      } catch {
+        // Not ours (different binding secret) or tampered — never log the blob.
+        continue;
+      }
+      try {
+        await relay.attachRun(
+          run.handleId,
+          { token: payload.token, ownerToken: payload.ownerToken },
+          undefined,
+          run.binding,
+        );
+      } catch {
+        // Raced a release/expiry or another live owner — skip this handle.
+        continue;
+      }
+      // Rehydrate restart-safe authority so THIS process serves the node's
+      // reverse RPC immediately. Never clobber a live entry a concurrent call
+      // already established from signed handle metadata.
+      if (payload.actor_scope !== undefined && !this.actorBindings.has(run.handleId)) {
+        this.actorBindings.set(run.handleId, {
+          scope: payload.actor_scope,
+          fingerprint: payload.actor_fingerprint ?? null,
+          actor: null,
+          actorJson: null,
+        });
+      }
+      if (payload.workflow_id !== undefined && !this.backendCallScopes.has(run.handleId)) {
+        this.backendCallScopes.set(run.handleId, {
+          subjectId: null,
+          workflowId: payload.workflow_id ?? null,
+          repository: payload.repository ?? null,
+        });
+      }
+    }
   }
 
   /** `prepare`: mint the run token, create the Railway service from the base
@@ -1855,7 +2012,23 @@ export class RailwayEnvironment {
     let plan: WorkspacePlan;
     try {
       relay = await this.relay();
-      ({ url, token, ownerToken } = await relay.registerRun(id));
+      // Mint the run credentials client-side (keeps registration retryable
+      // across a commit/ack crash) and seal the restart payload BEFORE
+      // registering so the singleton durably stores it atomically with the
+      // handle. A later plugin restart enumerates these registrations
+      // (listRuns) and reattaches every one at startup (TASK-1420).
+      const relayCredentials = {
+        token: randomBytes(32).toString('base64url'),
+        ownerToken: randomBytes(32).toString('base64url'),
+      };
+      const startupBinding = sealRelayBinding(this.relayBindingSecret, id, {
+        ...relayCredentials,
+        actor_scope: binding.scope,
+        actor_fingerprint: binding.fingerprint,
+        workflow_id: runId,
+        repository: repositoryScope,
+      });
+      ({ url, token, ownerToken } = await relay.registerRun(id, relayCredentials, undefined, false, startupBinding));
       plan = planWorkspace(spec, WORKSPACE_ROOT);
       // Validate every planned subdir up front (a spec-supplied repo `name` like
       // `../outside` must never escape the workspace root or poison the default
@@ -1972,7 +2145,14 @@ export class RailwayEnvironment {
       animus_actor_scope: binding.scope,
       animus_actor_fingerprint: binding.fingerprint,
       animus_relay_binding: ownerToken
-        ? sealRelayBinding(this.relayBindingSecret, id, { token, ownerToken })
+        ? sealRelayBinding(this.relayBindingSecret, id, {
+            token,
+            ownerToken,
+            actor_scope: binding.scope,
+            actor_fingerprint: binding.fingerprint,
+            workflow_id: runId,
+            repository: repositoryScope,
+          })
         : null,
     };
     const metadata: RailwayHandleMeta = {
