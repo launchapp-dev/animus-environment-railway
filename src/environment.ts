@@ -2241,7 +2241,9 @@ export class RailwayEnvironment {
    *  Owner-known mode: when `liveRunIds` (the daemon's authoritative set of live
    *  run ids) is supplied, a healthy node whose name maps to NO live run id is a
    *  leak and is reaped WITHOUT `force` — with a mandatory {@link
-   *  REAP_LEAKED_GRACE_SECS} floor so an in-flight `prepare` is never reaped. */
+   *  REAP_LEAKED_GRACE_SECS} floor so an in-flight `prepare` is never reaped.
+   *  Conversely a node whose run IS live is never reaped, not even when its
+   *  latest deployment is in a dead state: its owner drives teardown. */
   async reap(
     opts: {
       all?: boolean;
@@ -2285,6 +2287,14 @@ export class RailwayEnvironment {
       for (const node of nodes) {
         const dead = DEAD_DEPLOYMENT_STATES.has(node.state.toUpperCase());
         const live = liveNames.has(node.name);
+        // Owner-known: the daemon's live set is authoritative, so a node whose
+        // run is live is NEVER reaped — not even when its latest deployment is
+        // in a dead state. A crashed live-run node can still hold unpublished
+        // work and its owner drives teardown; the sweep must not delete it.
+        if (ownerKnown && live) {
+          kept.push(node);
+          continue;
+        }
         const oldEnough =
           graceSecs === undefined ||
           (node.created_at ? (now - Date.parse(node.created_at)) / 1000 >= graceSecs : true);

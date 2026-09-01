@@ -1786,6 +1786,50 @@ describe('prepare -> exec -> teardown (fake Railway, real relay + bridge)', () =
     expect(fake.deleted).toEqual([]);
   });
 
+  it('reap owner-known reaps the terminal-run zombie but NEVER the live run’s dead node (TASK-1466)', async () => {
+    const { env, fake } = await makeEnv();
+    const liveRun = 'run-live-crashed';
+    const terminalRun = 'run-terminal';
+    const liveName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', liveRun])).digest('hex').slice(0, 12);
+    const zombieName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', terminalRun])).digest('hex').slice(0, 12);
+    const old = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // older than the 300s grace
+    fake.detailed = [
+      // The live run's node CRASHED: the dead-state branch must not reap it out
+      // from under its owner (it may still hold unpublished work; the owner
+      // drives teardown).
+      { id: 'svc-live-crashed', name: liveName, status: 'CRASHED', createdAt: old },
+      // The terminal run's healthy SUCCESS node is the TASK-1466 zombie: the
+      // owner died with a terminal run, so default dead-state-only reap never
+      // touched it. Owner-known mode must delete it WITHOUT force.
+      { id: 'svc-zombie', name: zombieName, status: 'SUCCESS', createdAt: old },
+    ];
+    const res = await env.reap({ liveRunIds: [liveRun] });
+    expect(res.deleted).toEqual(['svc-zombie']);
+    expect(res.kept.map((n) => n.id)).toEqual(['svc-live-crashed']);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-zombie', environmentId: 'env-1' }]);
+  });
+
+  it('reap owner-known still reaps a non-live node when the substrate cannot report state', async () => {
+    const { env, fake } = await makeEnv();
+    // Force the describeNodes fallback (no detailed query): nodes come back with
+    // state 'unknown' and no created_at. The authoritative live set, not state,
+    // decides: the non-live node is reaped, the live one is kept.
+    const api: RailwayApi = fake; // the interface types the detailed query as optional
+    api.listRunServicesDetailed = undefined;
+    const liveRun = 'run-live';
+    const terminalRun = 'run-terminal';
+    const liveName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', liveRun])).digest('hex').slice(0, 12);
+    const zombieName = SERVICE_NAME_PREFIX + createHash('sha256').update(JSON.stringify(['proj-1', terminalRun])).digest('hex').slice(0, 12);
+    fake.listed = [
+      { id: 'svc-live', name: liveName },
+      { id: 'svc-zombie', name: zombieName },
+    ];
+    const res = await env.reap({ liveRunIds: [liveRun] });
+    expect(res.deleted).toEqual(['svc-zombie']);
+    expect(res.kept.map((n) => [n.id, n.state])).toEqual([['svc-live', 'unknown']]);
+    expect(fake.deleted).toEqual([{ serviceId: 'svc-zombie', environmentId: 'env-1' }]);
+  });
+
   it('health degrades (not fails) on missing per-run-suppliable config', async () => {
     const fake = new FakeRailway();
     const env = new RailwayEnvironment({ railway: fake, config: {} });
