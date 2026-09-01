@@ -161,8 +161,21 @@ const plugin = defineEnvironmentPlugin({
     {
       name: 'CLAUDE_CONFIG_DIR',
       description:
-        'Daemon-side dir holding the Claude subscription .credentials.json; base64-injected into each node so the claude harness runs on the subscription.',
+        'Daemon-side dir holding the Claude subscription .credentials.json; base64-injected into each node so the claude harness runs on the subscription. Legacy fallback when no capacity broker is configured.',
       required: false,
+    },
+    {
+      name: 'CAPACITY_BROKER_URL',
+      description:
+        'Portal capacity-broker internal API base (e.g. http://127.0.0.1:8088/api/capacity/internal). When set with CAPACITY_BROKER_TOKEN, node Claude/Kimi credentials are sourced from the Portal\'s locked single-writer credential-refresh endpoint instead of the daemon-side files.',
+      required: false,
+    },
+    {
+      name: 'CAPACITY_BROKER_TOKEN',
+      description:
+        'Bearer credential for CAPACITY_BROKER_URL. Parent-side only; never injected into nodes.',
+      required: false,
+      sensitive: true,
     },
     {
       name: 'ANTHROPIC_AUTH_TOKEN',
