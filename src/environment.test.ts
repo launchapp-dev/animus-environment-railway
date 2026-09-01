@@ -9,14 +9,14 @@
 // RAILWAY_PROJECT_ID + RAILWAY_ENVIRONMENT_ID are present.
 
 import { createHash, generateKeyPairSync } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { BridgeClient, RelayServer, type ExecutionFence } from '@launchapp-dev/animus-env-transport';
+import { BridgeClient, RelayServer, RelaySingleton, type ExecutionFence, type RelayListedRun } from '@launchapp-dev/animus-env-transport';
 import {
   defineEnvironmentPlugin,
   planWorkspace,
@@ -134,20 +134,53 @@ class RecordingRelay implements RelayTransport {
   readonly sessions: Array<{ handleId: string; params: Record<string, unknown> }> = [];
   readonly attachments: Array<{ handleId: string; token: string; ownerToken: string }> = [];
   readonly releases: Array<{ handleId: string; token?: string; ownerToken?: string }> = [];
-  private readonly handles = new Set<string>();
+  readonly registrations: Array<{ handleId: string; token: string; ownerToken: string; binding: string | null }> = [];
+  /** Handles THIS "process" has attached — empty after a simulated restart. */
+  private readonly attached = new Set<string>();
 
-  registerRun(handleId = 'relay-handle'): { url: string; token: string; ownerToken: string } {
-    this.handles.add(handleId);
-    return { url: `ws://relay/relay/${handleId}`, token: 'T'.repeat(43), ownerToken: 'O'.repeat(43) };
+  /** Durable registry state, shared across instances to simulate the singleton
+   *  outliving an owner (plugin) process restart. */
+  constructor(
+    readonly store = new Map<string, { token: string; ownerToken: string; binding: string | null }>(),
+  ) {}
+
+  registerRun(
+    handleId = 'relay-handle',
+    credentials?: { token: string; ownerToken: string },
+    _scope?: unknown,
+    _attach?: boolean,
+    binding?: string,
+  ): { url: string; token: string; ownerToken: string } {
+    const creds = credentials ?? { token: 'T'.repeat(43), ownerToken: 'O'.repeat(43) };
+    this.store.set(handleId, { ...creds, binding: binding ?? null });
+    this.attached.add(handleId);
+    this.registrations.push({ handleId, ...creds, binding: binding ?? null });
+    return { url: `ws://relay/relay/${handleId}`, ...creds };
   }
 
   async attachRun(
     handleId: string,
     credentials: { token: string; ownerToken: string },
+    _scope?: unknown,
+    binding?: string,
   ): Promise<{ url: string; token: string; ownerToken: string }> {
+    const existing = this.store.get(handleId);
+    if (!existing || existing.token !== credentials.token || existing.ownerToken !== credentials.ownerToken) {
+      throw new Error('reattach forbidden');
+    }
+    if (binding !== undefined) existing.binding = binding;
     this.attachments.push({ handleId, ...credentials });
-    this.handles.add(handleId);
+    this.attached.add(handleId);
     return { url: `ws://relay/relay/${handleId}`, ...credentials };
+  }
+
+  async listRuns(): Promise<RelayListedRun[]> {
+    return [...this.store].map(([handleId, run]) => ({
+      handleId,
+      binding: run.binding,
+      attached: this.attached.has(handleId),
+      nodeConnected: true,
+    }));
   }
 
   async waitForConnection(): Promise<void> {}
@@ -171,15 +204,17 @@ class RecordingRelay implements RelayTransport {
 
   releaseRun(handleId: string, credentials?: { token: string; ownerToken: string }): void {
     this.releases.push({ handleId, ...credentials });
-    this.handles.delete(handleId);
+    this.store.delete(handleId);
+    this.attached.delete(handleId);
   }
 
   registeredRuns(): string[] {
-    return [...this.handles];
+    return [...this.attached];
   }
 
   async close(): Promise<void> {
-    this.handles.clear();
+    // Detach-only, like RelayClient.close(): the durable store survives.
+    this.attached.clear();
   }
 }
 
@@ -2092,15 +2127,18 @@ describe('prepare -> exec_session actor binding', () => {
   });
 
   it('reattaches a persisted handle to a fresh relay with sealed exact credentials', async () => {
-    const { handle } = await boundEnvironment(alice);
+    const { handle, relay: original } = await boundEnvironment(alice);
     const metadata = handle.metadata as Record<string, unknown>;
     expect(metadata.animus_relay_binding).toEqual(expect.stringMatching(/^v1\./));
-    expect(String(metadata.animus_relay_binding)).not.toContain('T'.repeat(43));
-    expect(String(metadata.animus_relay_binding)).not.toContain('O'.repeat(43));
+    const registered = original.registrations[0];
+    expect(registered).toBeDefined();
+    expect(String(metadata.animus_relay_binding)).not.toContain(registered!.token);
+    expect(String(metadata.animus_relay_binding)).not.toContain(registered!.ownerToken);
 
     const fake = new FakeRailway();
     fake.bootBridge = false;
-    const relay = new RecordingRelay();
+    // The restarted process faces the SAME durable registry (singleton survives).
+    const relay = new RecordingRelay(original.store);
     const restarted = new RailwayEnvironment({
       railway: fake,
       relay,
@@ -2124,8 +2162,8 @@ describe('prepare -> exec_session actor binding', () => {
     ).resolves.toEqual({ workflow_id: 'wf-restarted', status: 'completed' });
     expect(relay.attachments).toEqual([{
       handleId: handle.id,
-      token: 'T'.repeat(43),
-      ownerToken: 'O'.repeat(43),
+      token: registered!.token,
+      ownerToken: registered!.ownerToken,
     }]);
     expect(relay.sessions).toHaveLength(1);
   });
@@ -2160,10 +2198,10 @@ describe('prepare -> exec_session actor binding', () => {
   });
 
   it('tears down from a restarted process using the sealed relay credentials', async () => {
-    const { handle } = await boundEnvironment(alice);
+    const { handle, relay: original } = await boundEnvironment(alice);
     const fake = new FakeRailway();
     fake.bootBridge = false;
-    const relay = new RecordingRelay();
+    const relay = new RecordingRelay(original.store);
     const restarted = new RailwayEnvironment({
       railway: fake,
       relay,
@@ -2176,14 +2214,236 @@ describe('prepare -> exec_session actor binding', () => {
     live.push({ env: restarted, fake });
 
     await restarted.teardown(handle);
-    expect(relay.attachments).toHaveLength(0);
+    // The restarted process's first relay use runs the startup reattach, so the
+    // handle is attached once (with its exact sealed credentials) before the
+    // teardown releases it.
+    expect(relay.attachments).toEqual([{
+      handleId: handle.id,
+      token: original.registrations[0]!.token,
+      ownerToken: original.registrations[0]!.ownerToken,
+    }]);
     expect(relay.releases).toEqual([{
       handleId: handle.id,
-      token: 'T'.repeat(43),
-      ownerToken: 'O'.repeat(43),
+      token: original.registrations[0]!.token,
+      ownerToken: original.registrations[0]!.ownerToken,
     }]);
     expect(fake.deleted).toEqual([{ serviceId: 'svc-1', environmentId: 'env-1' }]);
   });
+
+  it('stores a sealed restart payload with the relay registration at prepare', async () => {
+    const { handle, relay } = await boundEnvironment(alice);
+    const stored = relay.store.get(handle.id);
+    expect(stored).toBeDefined();
+    expect(stored!.binding).toEqual(expect.stringMatching(/^v1\./));
+    // The blob is AEAD-sealed: the plaintext run credentials never appear in it.
+    expect(String(stored!.binding)).not.toContain(stored!.token);
+    expect(String(stored!.binding)).not.toContain(stored!.ownerToken);
+  });
+
+  it('reattaches every still-registered run at startup and rehydrates reverse-RPC authority', async () => {
+    // The TASK-1420 orphan shape: the plugin process dies mid-session while the
+    // singleton keeps the registration + node leg. The restarted process must
+    // reattach the handle at boot — without waiting for a fresh exec_session.
+    const { env: first, handle, relay: firstRelay } = await boundEnvironment(alice);
+    await first.close();
+
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay(firstRelay.store);
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+
+    await restarted.restoreRelayRuns();
+    expect(relay.registeredRuns()).toEqual([handle.id]);
+    expect(relay.attachments).toEqual([{
+      handleId: handle.id,
+      token: firstRelay.registrations[0]!.token,
+      ownerToken: firstRelay.registrations[0]!.ownerToken,
+    }]);
+
+    // The restored handle runs a same-actor session with NO further attach...
+    await expect(
+      restarted.runSession(
+        handle,
+        { subject_id: 'task:TASK-1', workflow_id: 'wf-restored' },
+        undefined,
+        alice,
+        alice,
+        true,
+      ),
+    ).resolves.toEqual({ workflow_id: 'wf-restored', status: 'completed' });
+    expect(relay.attachments).toHaveLength(1);
+
+    // ...and the rehydrated actor binding still rejects a different actor.
+    await expect(
+      restarted.runSession(handle, { subject_id: 'task:TASK-1' }, undefined, bob, bob, true),
+    ).rejects.toThrow(/actor does not match/);
+  });
+
+  it('skips registrations sealed under a different binding secret at startup', async () => {
+    const { handle, relay: firstRelay } = await boundEnvironment(alice);
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay(firstRelay.store);
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'different-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+
+    await restarted.restoreRelayRuns();
+    expect(relay.attachments).toHaveLength(0);
+    expect(relay.registeredRuns()).toEqual([]);
+    // The durable registration itself is untouched — the rightful owner can
+    // still reattach it later.
+    expect(relay.store.has(handle.id)).toBe(true);
+  });
+
+  it('does not resurrect a released handle at startup', async () => {
+    const { env: first, handle, relay: firstRelay } = await boundEnvironment(alice);
+    await first.teardown(handle);
+    expect(firstRelay.store.has(handle.id)).toBe(false);
+
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay(firstRelay.store);
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+
+    await restarted.restoreRelayRuns();
+    expect(relay.attachments).toHaveLength(0);
+    expect(relay.registeredRuns()).toEqual([]);
+  });
+
+  it('treats a relay without run listing as no startup reattach (legacy transport)', async () => {
+    const { handle, relay: firstRelay } = await boundEnvironment(alice);
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay(firstRelay.store);
+    (relay as { listRuns?: unknown }).listRuns = undefined;
+    const restarted = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: {
+        projectId: 'proj-1',
+        environmentId: 'env-1',
+        actorBindingSecret: 'test-binding-secret',
+      },
+    });
+    live.push({ env: restarted, fake });
+
+    await expect(restarted.restoreRelayRuns()).resolves.toBeUndefined();
+    expect(relay.attachments).toHaveLength(0);
+    expect(relay.store.has(handle.id)).toBe(true);
+  });
+
+  it('serves a live node\'s reverse RPC after the plugin process restarts (TASK-1420 end-to-end)', async () => {
+    // The production defect, full stack: a real singleton relay, a real
+    // BridgeClient "node", and the plugin's real reverse-RPC wiring (actor-bound
+    // handler + scoped authorizer + parent backend plugin). The plugin process
+    // "dies" mid-session; the restarted process must reattach the orphaned
+    // handle AT STARTUP so the same node's backend/call answers again.
+    const root = mkdtempSync(join(tmpdir(), 'env-railway-restore-'));
+    const socketPath = join(root, 'relay.sock');
+    const backendBin = join(root, 'fake-backend.mjs');
+    writeFileSync(
+      backendBin,
+      `#!/usr/bin/env node
+let buf = '';
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const msg = JSON.parse(line);
+    if (msg.id !== undefined) {
+      process.stdout.write(JSON.stringify({ id: msg.id, result: { ok: true, method: msg.method } }) + '\\n');
+    }
+  }
+});
+`,
+    );
+    chmodSync(backendBin, 0o755);
+
+    const singleton = await RelaySingleton.listen({
+      host: '127.0.0.1',
+      port: 0,
+      socketPath,
+      registryPath: join(root, 'relay-registry.json'),
+    });
+    const config = {
+      projectId: 'proj-1',
+      environmentId: 'env-1',
+      dialTimeoutSecs: 10,
+      actorBindingSecret: 'test-binding-secret',
+      relaySocketPath: socketPath,
+      upstreamBackendBin: backendBin,
+      databaseUrl: 'postgres://fake',
+    };
+    const fake = new FakeRailway();
+    const first = new RailwayEnvironment({ railway: fake, config });
+    live.push({ env: first, fake });
+    try {
+      const { handle } = await first.prepare(
+        { spec: { kind: 'railway' } },
+        alice,
+        alice,
+        true,
+      );
+      const bridge = fake.bridges[0];
+      expect(bridge).toBeDefined();
+      await expect(
+        bridge!.backendCall('workflow_journal', 'journal/schema', {}),
+      ).resolves.toEqual({ ok: true, method: 'journal/schema' });
+
+      // Plugin process dies mid-session (daemon redeploy / runtime activation).
+      // Close is detach-only: the singleton keeps the registration + node leg.
+      await first.close();
+
+      const restartedFake = new FakeRailway();
+      const restarted = new RailwayEnvironment({ railway: restartedFake, config });
+      live.push({ env: restarted, fake: restartedFake });
+      await restarted.restoreRelayRuns();
+      // Startup reattach never prepares a second node.
+      expect(restartedFake.created).toHaveLength(0);
+
+      // The SAME bridge process's reverse RPC is answered by the NEW plugin
+      // process (its rehydrated authority + freshly spawned backend).
+      await expect(
+        bridge!.backendCall('workflow_journal', 'journal/schema', {}),
+      ).resolves.toEqual({ ok: true, method: 'journal/schema' });
+
+      // Teardown from the restarted process still releases the exact handle.
+      await restarted.teardown(handle);
+      expect(singleton.registeredRuns()).toEqual([]);
+    } finally {
+      await singleton.close().catch(() => undefined);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('rejects malformed prepare actors before creating a service', async () => {
     const fake = new FakeRailway();

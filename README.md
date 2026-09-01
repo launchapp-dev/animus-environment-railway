@@ -87,10 +87,16 @@ node-originated reverse RPC. `ANIMUS_ENV_ACTOR_BINDING_SECRET` may provide a
 dedicated stable signing key; when omitted, `RAILWAY_TOKEN` is used.
 
 Relay ownership is restart-safe as well. New handles contain an AEAD-sealed
-run token and owner token covered by the actor-binding HMAC. After the Portal,
-daemon, or environment-plugin process restarts, the plugin presents those
-exact credentials to the durable singleton registration and resumes the same
-session ID; it never prepares a second node or workflow. Configure
+run token and owner token covered by the actor-binding HMAC, and `prepare`
+stores the same sealed payload (plus the restart-safe actor binding and
+backend scope) with the durable singleton registration. At boot the plugin
+enumerates the singleton's still-registered runs (`listRuns`) and reattaches
+every one — so a live node's reverse RPC routes to the NEW plugin process
+after a Portal/daemon/plugin restart even when no fresh `exec_session` call
+ever arrives. Handles registered before this mechanism carry no stored
+binding and still reattach lazily when the daemon next presents the handle.
+The plugin never prepares a second node or workflow for a restored handle.
+Configure
 `ANIMUS_ENV_RELAY_CONTROL_TOKEN` as a 32-byte base64url credential shared with
 the singleton. `ANIMUS_ENV_RELAY_BINDING_SECRET` should be stable across
 deploys; it defaults to the actor-binding secret or `RAILWAY_TOKEN`.
