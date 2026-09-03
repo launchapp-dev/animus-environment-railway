@@ -2143,6 +2143,24 @@ export class RailwayEnvironment {
       // metadata key; this is then a no-op. A failed write fails prepare like
       // a failed clone: a run with declared skills must not start without them.
       const skills = await skillsSyncFiles(spec);
+      // SPEC-001 diagnostics: plugin stderr vanishes into the host's tracing
+      // in hosted environments, so record the sync decision on the durable
+      // portal volume. Contents are never logged — keys + counts only.
+      try {
+        const { appendFile, mkdir } = await import('node:fs/promises');
+        const meta = (spec.metadata ?? {}) as Record<string, unknown>;
+        const line = JSON.stringify({
+          ts: new Date().toISOString(),
+          run: typeof meta.animus_run_id === 'string' ? meta.animus_run_id : null,
+          metadata_keys: Object.keys(meta).sort(),
+          skills_sync_dir: typeof meta.skills_sync_dir === 'string' ? meta.skills_sync_dir : null,
+          files: skills ? skills.length : null,
+        });
+        await mkdir('/data/animus-state', { recursive: true });
+        await appendFile('/data/animus-state/skills-sync.log', line + '\n');
+      } catch {
+        // diagnostics must never affect prepare
+      }
       if (skills && skills.length > 0) {
         for (const skill of skills) {
           // The name is regex-sanitized above, so inlining it is shell-safe.
