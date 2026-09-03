@@ -21,6 +21,7 @@ import {
   defineEnvironmentPlugin,
   planWorkspace,
   type EnvironmentPluginSpec,
+  type HarnessCommand,
 } from '@launchapp-dev/animus-environment-base';
 
 import {
@@ -49,6 +50,7 @@ import {
   type RelayTransport,
   resolveTarget,
   runVariables,
+  skillsSyncFiles,
   ACTOR_ENV,
   WORKSPACE_ROOT,
 } from './environment.js';
@@ -185,8 +187,18 @@ class RecordingRelay implements RelayTransport {
 
   async waitForConnection(): Promise<void> {}
 
-  async exec(): Promise<{ exit_code: number; stdout: string; stderr: string; timed_out: boolean }> {
-    return { exit_code: 0, stdout: '', stderr: '', timed_out: false };
+  /** Every exec the plugin issued, in order. */
+  readonly execCalls: Array<{ handleId?: string; command?: HarnessCommand; stdin?: string | null }> = [];
+  /** Exit code the next execs report (default success). */
+  execExitCode = 0;
+
+  async exec(
+    handleId?: string,
+    command?: HarnessCommand,
+    opts?: { stdin?: string | null },
+  ): Promise<{ exit_code: number; stdout: string; stderr: string; timed_out: boolean }> {
+    this.execCalls.push({ handleId, command, stdin: opts?.stdin ?? null });
+    return { exit_code: this.execExitCode, stdout: '', stderr: '', timed_out: false };
   }
 
   async runSession(
@@ -929,6 +941,103 @@ describe('pure helpers', () => {
           config: { capacityConfirmationTimeoutMs: -1 },
         }),
     ).toThrow(/CAPACITY_CONFIRMATION_TIMEOUT_MS must be a non-negative integer/);
+  });
+});
+
+describe('skills sync (SPEC-001)', () => {
+  function makeRecordingEnv(): Ctx & { relay: RecordingRelay } {
+    const fake = new FakeRailway();
+    fake.bootBridge = false;
+    const relay = new RecordingRelay();
+    const env = new RailwayEnvironment({
+      railway: fake,
+      relay,
+      config: { projectId: 'proj-1', environmentId: 'env-1' },
+    });
+    live.push({ env, fake });
+    return { env, fake, relay };
+  }
+
+  it('skillsSyncFiles returns null for absent/empty metadata and unreadable dirs', async () => {
+    expect(await skillsSyncFiles({})).toBeNull();
+    expect(await skillsSyncFiles({ metadata: {} })).toBeNull();
+    expect(await skillsSyncFiles({ metadata: { skills_sync_dir: '   ' } })).toBeNull();
+    // Unreadable dir: a warn + null, never a throw.
+    await expect(
+      skillsSyncFiles({ metadata: { skills_sync_dir: '/nonexistent/skills-sync-dir' } }),
+    ).resolves.toBeNull();
+  });
+
+  it('skillsSyncFiles base64s sanitized *.yaml files and skips the rest', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'skills-sync-'));
+    try {
+      writeFileSync(join(dir, 'code-review.yaml'), 'name: code-review\n');
+      writeFileSync(join(dir, 'test-writer.yaml'), 'name: test-writer\n');
+      writeFileSync(join(dir, 'NOTES.md'), 'not yaml'); // ignored silently
+      writeFileSync(join(dir, 'Bad_Name.yaml'), 'name: bad\n'); // unsafe name: skipped with a warn
+      const files = await skillsSyncFiles({ metadata: { skills_sync_dir: dir } });
+      expect(files?.map((f) => f.name)).toEqual(['code-review.yaml', 'test-writer.yaml']);
+      expect(Buffer.from(files?.[0]?.contentBase64 ?? '', 'base64').toString('utf8')).toBe('name: code-review\n');
+      expect(Buffer.from(files?.[1]?.contentBase64 ?? '', 'base64').toString('utf8')).toBe('name: test-writer\n');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('prepare writes each synced skill onto the node before any phase runs', async () => {
+    const { env, relay } = makeRecordingEnv();
+    const dir = mkdtempSync(join(tmpdir(), 'skills-sync-'));
+    try {
+      writeFileSync(join(dir, 'code-review.yaml'), 'name: code-review\n');
+      writeFileSync(join(dir, 'test-writer.yaml'), 'name: test-writer\n');
+      const { handle } = await env.prepare({ spec: { kind: 'railway', metadata: { skills_sync_dir: dir } } });
+      expect(relay.execCalls).toHaveLength(2);
+      for (const [i, name] of ['code-review.yaml', 'test-writer.yaml'].entries()) {
+        const call = relay.execCalls[i];
+        expect(call?.handleId).toBe(handle.id);
+        expect(call?.command?.program).toBe('sh');
+        const script = call?.command?.args?.[1] ?? '';
+        expect(script).toContain('d="${HOME:-/root}/.animus/config/skill_definitions"');
+        expect(script).toContain('mkdir -p "$d"');
+        expect(script).toContain(`base64 -d > "$d/${name}"`);
+        expect(Buffer.from(call?.stdin ?? '', 'base64').toString('utf8')).toBe(`name: ${name.replace('.yaml', '')}\n`);
+      }
+      await env.teardown(handle);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('prepare without skills_sync_dir makes no sync calls', async () => {
+    const { env, relay } = makeRecordingEnv();
+    const { handle } = await env.prepare({ spec: { kind: 'railway' } });
+    expect(relay.execCalls).toHaveLength(0);
+    await env.teardown(handle);
+  });
+
+  it('prepare with an unreadable skills_sync_dir still prepares (no sync calls)', async () => {
+    const { env, relay } = makeRecordingEnv();
+    const { handle } = await env.prepare({
+      spec: { kind: 'railway', metadata: { skills_sync_dir: '/nonexistent/skills-sync-dir' } },
+    });
+    expect(relay.execCalls).toHaveLength(0);
+    await env.teardown(handle);
+  });
+
+  it('a failed skills-sync write fails prepare like a failed clone', async () => {
+    const { env, fake, relay } = makeRecordingEnv();
+    const dir = mkdtempSync(join(tmpdir(), 'skills-sync-'));
+    try {
+      writeFileSync(join(dir, 'code-review.yaml'), 'name: code-review\n');
+      relay.execExitCode = 1;
+      await expect(
+        env.prepare({ spec: { kind: 'railway', metadata: { skills_sync_dir: dir } } }),
+      ).rejects.toThrow(/skills-sync write failed \(exit 1\) for code-review\.yaml/);
+      // Rolled back: the half-prepared service was deleted.
+      expect(fake.deleted).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

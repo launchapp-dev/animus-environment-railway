@@ -23,7 +23,7 @@ import {
 import { readFileSync, writeFileSync } from 'node:fs';
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createConnection, createServer, type Server } from 'node:net';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 import {
   planWorkspace,
@@ -814,6 +814,44 @@ export function cloneCommands(plan: WorkspacePlan): HarnessCommand[] {
     commands.push({ program: 'git', args: cloneArgs, cwd: '/' });
   }
   return commands;
+}
+
+/** A synced skill definition file name: a single safe path segment that the
+ *  node's user-tier `skill_definitions` dir accepts (kernel skill name rules). */
+const SKILL_FILE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}\.yaml$/;
+
+/** Read the daemon-materialized skill definitions for this run
+ *  (`spec.metadata.skills_sync_dir`, SPEC-001): each `<skill-name>.yaml` in
+ *  the dir becomes one file under the node's user-tier `skill_definitions`
+ *  dir. Absent/empty metadata (old daemons never set it) and unreadable dirs
+ *  return null with at most a warn — never a throw: the node reports missing
+ *  skills loudly itself. File CONTENTS are never logged. */
+export async function skillsSyncFiles(
+  spec: { metadata?: unknown },
+): Promise<{ name: string; contentBase64: string }[] | null> {
+  const meta = (spec.metadata ?? {}) as Record<string, unknown>;
+  const dir = typeof meta.skills_sync_dir === 'string' ? meta.skills_sync_dir.trim() : '';
+  if (!dir) return null;
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[animus-environment-railway] skills-sync: cannot read dir '${dir}': ${message}\n`);
+    return null;
+  }
+  const files: { name: string; contentBase64: string }[] = [];
+  for (const entry of entries.sort()) {
+    const name = basename(entry);
+    if (!SKILL_FILE_NAME_RE.test(name)) {
+      if (entry.endsWith('.yaml')) {
+        process.stderr.write(`[animus-environment-railway] skills-sync: skipping unsafe file name '${name}'\n`);
+      }
+      continue;
+    }
+    files.push({ name, contentBase64: (await readFile(join(dir, entry))).toString('base64') });
+  }
+  return files;
 }
 
 const CLAUDE_OAUTH_TOKEN_URL =
@@ -2096,6 +2134,38 @@ export class RailwayEnvironment {
             `repo clone failed (exit ${res.exit_code}) for ${command.args?.slice(-2)[0] ?? '?'}: ${(res.stderr ?? '').trim()}`,
           );
         }
+      }
+
+      // SPEC-001: copy the daemon-materialized skill definitions onto the
+      // node's user tier BEFORE any phase can start (same ordering guarantee
+      // as the clones above) — the remote runner resolves skills locally from
+      // $HOME/.animus/config/skill_definitions. Old daemons never set the
+      // metadata key; this is then a no-op. A failed write fails prepare like
+      // a failed clone: a run with declared skills must not start without them.
+      const skills = await skillsSyncFiles(spec);
+      if (skills && skills.length > 0) {
+        for (const skill of skills) {
+          // The name is regex-sanitized above, so inlining it is shell-safe.
+          const res = await relay.exec(
+            id,
+            {
+              program: 'sh',
+              args: [
+                '-c',
+                `d="\${HOME:-/root}/.animus/config/skill_definitions"; mkdir -p "$d" && base64 -d > "$d/${skill.name}"`,
+              ],
+            },
+            { stdin: skill.contentBase64, timeoutSecs: 60 },
+          );
+          if (res.exit_code !== 0) {
+            throw new Error(
+              `skills-sync write failed (exit ${res.exit_code}) for ${skill.name}: ${(res.stderr ?? '').trim()}`,
+            );
+          }
+        }
+        process.stderr.write(
+          `[animus-environment-railway] skills-sync: wrote ${skills.length} skill definition(s) to node ${id}\n`,
+        );
       }
 
       // Opt-in provisioning: restore the pinned plugin set from the cloned
